@@ -1,0 +1,8 @@
+{
+  "database": {
+    "path": "data/db.sqlite",
+    "migrate": "bun run db:migrate",
+    "validate": "bun run db:health"
+  },
+  "healthCheck": "curl -f http://localhost:3000/health"
+}

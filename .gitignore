@@ -144,3 +144,7 @@ secrets/
 
 # Operational state (server-only, see services-state.json.example)
 server/services-state.json
+
+# Database migration artifacts (local development)
+deploy-tmp/
+deploy.json

@@ -330,12 +330,112 @@ app_maint() {
 # Deployment
 # =============================================================================
 
+# Internal helper: Backup database on server and upload migrated version
+_deploy_db_backup_and_upload() {
+  local service_name=$1
+  local db_path=$2
+
+  echo "💾 Backing up database on server..."
+  ssh $SIG_SERVER "cd /srv/$service_name && \
+    if [ -f $db_path.backup.1 ]; then mv $db_path.backup.1 $db_path.backup.2; fi && \
+    if [ -f $db_path ]; then cp $db_path $db_path.backup.1; fi" || {
+    echo "❌ Failed to backup database"
+    return 1
+  }
+
+  echo "📤 Uploading migrated database..."
+  scp "deploy-tmp/db.sqlite" "$SIG_SERVER:/srv/$service_name/$db_path.new" || {
+    echo "❌ Failed to upload database"
+    return 1
+  }
+
+  ssh $SIG_SERVER "cd /srv/$service_name && \
+    sudo chown $service_name:$service_name $db_path.new && \
+    sudo -u $service_name mv $db_path.new $db_path" || {
+    echo "❌ Failed to swap database"
+    return 1
+  }
+
+  echo "✅ Database uploaded and activated"
+}
+
+# Internal helper: Rollback database from backup
+_deploy_db_rollback() {
+  local service_name=$1
+  local db_path=$2
+
+  echo "⏪ Rolling back database..."
+  ssh $SIG_SERVER "cd /srv/$service_name && \
+    if [ -f $db_path.backup.1 ]; then \
+      sudo -u $service_name cp $db_path.backup.1 $db_path; \
+      echo '✅ Database rolled back to backup.1'; \
+    else \
+      echo '⚠️  No backup found to restore'; \
+    fi"
+}
+
 deploy() {
   local service_name=$(basename "$PWD")
   local build_config=".build"
-  
+  local has_database=false
+  local db_path=""
+  local db_migrate_cmd=""
+  local db_validate_cmd=""
+  local health_check_cmd=""
+
   echo "🚀 Deploying $service_name..."
   echo ""
+
+  # Check for deploy.json
+  if [[ -f "deploy.json" ]]; then
+    db_path=$(jq -r '.database.path // empty' deploy.json)
+    if [[ -n "$db_path" ]]; then
+      has_database=true
+      db_migrate_cmd=$(jq -r '.database.migrate' deploy.json)
+      db_validate_cmd=$(jq -r '.database.validate' deploy.json)
+      echo "📊 Database detected: $db_path"
+    fi
+    health_check_cmd=$(jq -r '.healthCheck // empty' deploy.json)
+  fi
+
+  # Database migration workflow
+  if [[ "$has_database" == "true" ]]; then
+    echo ""
+    echo "🔄 Database Migration Workflow"
+    echo "────────────────────────────────────────"
+
+    # 1. Enable maintenance mode
+    echo "🚧 Enabling maintenance mode..."
+    ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
+
+    # 2. Download DB
+    echo "📥 Downloading production database..."
+    mkdir -p deploy-tmp
+    scp "$SIG_SERVER:/srv/$service_name/$db_path" "deploy-tmp/db.sqlite" || {
+      echo "❌ Failed to download database. Aborting."
+      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
+      return 1
+    }
+
+    # 3. Run migration
+    echo "🔄 Running migration: $db_migrate_cmd"
+    DB_PATH="deploy-tmp/db.sqlite" eval "$db_migrate_cmd" || {
+      echo "❌ Migration failed. Aborting."
+      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
+      return 1
+    }
+
+    # 4. Run validation
+    echo "🔍 Running validation: $db_validate_cmd"
+    DB_PATH="deploy-tmp/db.sqlite" eval "$db_validate_cmd" || {
+      echo "❌ Validation failed. Aborting."
+      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
+      return 1
+    }
+
+    echo "✅ Migration and validation successful"
+    echo ""
+  fi
 
   # Step 1: Local build (optional)
   if [ -f "$build_config" ]; then
@@ -350,7 +450,7 @@ deploy() {
 
   # Step 2: Git commit & push
   echo "📦 Handling Git workflow..."
-  
+
   if ! git diff-index --quiet HEAD -- 2>/dev/null; then
     read -r "msg?Commit message (default: 'deploy'): "
     msg=${msg:-"deploy"}
@@ -358,17 +458,39 @@ deploy() {
   else
     echo "   No local changes to commit."
   fi
-  
+
   git push origin $(git rev-parse --abbrev-ref HEAD) || { echo "❌ Push failed."; return 1; }
   echo ""
 
-  # Step 3: Remote deployment
+  # Step 3: Upload database if migrated
+  if [[ "$has_database" == "true" ]]; then
+    _deploy_db_backup_and_upload "$service_name" "$db_path" || {
+      echo "❌ Database upload failed. Aborting."
+      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
+      return 1
+    }
+    echo ""
+  fi
+
+  # Step 4: Remote deployment
   echo "🌐 Running remote deployment..."
   echo "────────────────────────────────────────"
-  
-  if ! ssh -t $SIG_SERVER "bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name"; then
+
+  local deploy_cmd="bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name"
+  if [[ -n "$health_check_cmd" ]]; then
+    deploy_cmd="$deploy_cmd --health-check '$health_check_cmd'"
+  fi
+
+  if ! ssh -t $SIG_SERVER "$deploy_cmd"; then
     echo "────────────────────────────────────────"
     echo "❌ Deployment failed!"
+
+    # Rollback database if it was involved
+    if [[ "$has_database" == "true" ]]; then
+      echo ""
+      _deploy_db_rollback "$service_name" "$db_path"
+    fi
+
     echo ""
     echo "Useful commands:"
     echo "  deploy_status $service_name"
@@ -376,11 +498,11 @@ deploy() {
     echo "  ssh $SIG_SERVER 'sudo journalctl -u $service_name -n 50'"
     return 1
   fi
-  
+
   echo "────────────────────────────────────────"
   echo ""
 
-  # Step 4: Tail logs
+  # Step 5: Tail logs
   echo "📋 Tailing logs (Ctrl+C to exit)..."
   echo "────────────────────────────────────────"
   ssh -t $SIG_SERVER "sudo journalctl -u $service_name -f -n 20"
@@ -393,12 +515,105 @@ deploy_status() {
 
 deploy_rollback() {
   local service_name=${1:-$(basename "$PWD")}
-  
+
   echo "⚠️  This will rollback $service_name to the previous commit."
   read -r "confirm?Are you sure? (y/n): "
   [[ "$confirm" != "y" ]] && { echo "Cancelled."; return 0; }
-  
+
   ssh -t $SIG_SERVER "bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name --rollback"
+}
+
+# =============================================================================
+# Database Development Tools
+# =============================================================================
+
+db_pull() {
+  local service_name=${1:-$(basename "$PWD")}
+
+  # Check for deploy.json
+  if [[ ! -f "deploy.json" ]]; then
+    echo "❌ No deploy.json found in current directory"
+    return 1
+  fi
+
+  # Parse database path
+  local db_path=$(jq -r '.database.path // empty' deploy.json)
+  if [[ -z "$db_path" ]]; then
+    echo "❌ No database configuration found in deploy.json"
+    return 1
+  fi
+
+  echo "📥 Downloading production database for $service_name..."
+  mkdir -p deploy-tmp
+
+  scp "$SIG_SERVER:/srv/$service_name/$db_path" "deploy-tmp/db.sqlite" || {
+    echo "❌ Failed to download database"
+    return 1
+  }
+
+  echo "✅ Database downloaded to: deploy-tmp/db.sqlite"
+  echo ""
+  echo "Next steps:"
+  echo "  db_migrate_test   # Run migration on downloaded DB"
+  echo "  db_validate_test  # Validate migration"
+}
+
+db_migrate_test() {
+  if [[ ! -f "deploy.json" ]]; then
+    echo "❌ No deploy.json found"
+    return 1
+  fi
+
+  if [[ ! -f "deploy-tmp/db.sqlite" ]]; then
+    echo "❌ No database found in deploy-tmp/. Run db_pull first."
+    return 1
+  fi
+
+  local migrate_cmd=$(jq -r '.database.migrate // empty' deploy.json)
+  if [[ -z "$migrate_cmd" ]]; then
+    echo "❌ No migration command in deploy.json"
+    return 1
+  fi
+
+  echo "🔄 Running migration: $migrate_cmd"
+  echo "   DB_PATH=deploy-tmp/db.sqlite"
+  echo ""
+
+  DB_PATH="deploy-tmp/db.sqlite" eval "$migrate_cmd" || {
+    echo "❌ Migration failed"
+    return 1
+  }
+
+  echo "✅ Migration completed"
+}
+
+db_validate_test() {
+  if [[ ! -f "deploy.json" ]]; then
+    echo "❌ No deploy.json found"
+    return 1
+  fi
+
+  if [[ ! -f "deploy-tmp/db.sqlite" ]]; then
+    echo "❌ No database found in deploy-tmp/. Run db_pull and db_migrate_test first."
+    return 1
+  fi
+
+  local validate_cmd=$(jq -r '.database.validate // empty' deploy.json)
+  if [[ -z "$validate_cmd" ]]; then
+    echo "❌ No validation command in deploy.json"
+    return 1
+  fi
+
+  echo "🔍 Running validation: $validate_cmd"
+  echo "   DB_PATH=deploy-tmp/db.sqlite"
+  echo ""
+
+  DB_PATH="deploy-tmp/db.sqlite" eval "$validate_cmd" || {
+    echo "❌ Validation failed"
+    return 1
+  }
+
+  echo "✅ Validation passed"
 }
 
 # =============================================================================
@@ -417,6 +632,11 @@ helpme() {
   echo "deploy         : Deploy current folder to server"
   echo "deploy_status  : Check service status (deploy_status [service])"
   echo "deploy_rollback: Rollback to previous commit"
+  echo ""
+  echo "--- DATABASE DEVELOPMENT ---"
+  echo "db_pull        : Download production database for local testing"
+  echo "db_migrate_test: Run migration on downloaded database"
+  echo "db_validate_test: Run validation on migrated database"
   echo ""
   echo "--- SERVICE SETUP ---"
   echo "service_create : Interactive wizard to create new service"

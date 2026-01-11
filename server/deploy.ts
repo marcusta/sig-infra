@@ -10,6 +10,7 @@
  *   bun deploy.ts <service-name>           # Full deploy
  *   bun deploy.ts <service-name> --status  # Check service status
  *   bun deploy.ts <service-name> --rollback # Rollback to previous commit
+ *   bun deploy.ts <service-name> --health-check '<command>' # Deploy with custom health check
  */
 
 import { $ } from "bun";
@@ -113,14 +114,25 @@ async function checkSystemdService(serviceName: string): Promise<boolean> {
   }
 }
 
-async function waitForHealthy(serviceName: string, port: number, maxAttempts = 10): Promise<boolean> {
+async function waitForHealthy(
+  serviceName: string,
+  port: number,
+  customHealthCheck?: string,
+  maxAttempts = 10
+): Promise<boolean> {
   console.log(`⏳ Waiting for service to be healthy...`);
-  
+
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      // Simple TCP check - just see if port is listening
-      await $`nc -z localhost ${port}`.quiet();
-      return true;
+      if (customHealthCheck) {
+        // Run custom health check command
+        await $`sh -c ${customHealthCheck}`.quiet();
+        return true;
+      } else {
+        // Simple TCP check - just see if port is listening
+        await $`nc -z localhost ${port}`.quiet();
+        return true;
+      }
     } catch {
       await Bun.sleep(1000);
     }
@@ -132,19 +144,19 @@ async function waitForHealthy(serviceName: string, port: number, maxAttempts = 1
 // Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function deploy(serviceName: string): Promise<void> {
+async function deploy(serviceName: string, healthCheckCmd?: string): Promise<void> {
   const servicePath = `/srv/${serviceName}`;
-  
+
   // Validate
   console.log(`\n🚀 Deploying ${serviceName}...\n`);
-  
+
   const services = await loadServices();
   if (!services[serviceName]) {
     console.error(`❌ Service '${serviceName}' not found in Caddy config`);
     console.error(`   Run: caddy_add ${serviceName} <port>`);
     process.exit(1);
   }
-  
+
   const port = services[serviceName].port;
   
   // Check service directory exists
@@ -172,7 +184,7 @@ async function deploy(serviceName: string): Promise<void> {
     await $`sudo systemctl restart ${serviceName}`;
     
     // Step 4: Health check
-    const healthy = await waitForHealthy(serviceName, port);
+    const healthy = await waitForHealthy(serviceName, port, healthCheckCmd);
     if (!healthy) {
       throw new Error(`Service failed to become healthy on port ${port}`);
     }
@@ -251,11 +263,11 @@ async function rollback(serviceName: string): Promise<void> {
     console.log(`🔄 Restarting service...`);
     await $`sudo systemctl restart ${serviceName}`;
     
-    // Health check
+    // Health check (note: rollback doesn't support custom health check)
     const services = await loadServices();
     const port = services[serviceName].port;
     const healthy = await waitForHealthy(serviceName, port);
-    
+
     if (!healthy) {
       throw new Error(`Service failed to become healthy after rollback`);
     }
@@ -280,13 +292,19 @@ async function rollback(serviceName: string): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const serviceName = args.find(a => !a.startsWith("--"));
-  const command = args.find(a => a.startsWith("--"));
-  
+  const command = args.find(a => a.startsWith("--") && !a.includes("--health-check"));
+
+  // Extract health check command if provided
+  const healthCheckIndex = args.indexOf("--health-check");
+  const healthCheckCmd = healthCheckIndex >= 0 && args[healthCheckIndex + 1]
+    ? args[healthCheckIndex + 1]
+    : undefined;
+
   if (!serviceName) {
-    console.error("Usage: bun deploy.ts <service-name> [--status|--rollback]");
+    console.error("Usage: bun deploy.ts <service-name> [--status|--rollback|--health-check '<command>']");
     process.exit(1);
   }
-  
+
   switch (command) {
     case "--status":
       await status(serviceName);
@@ -295,7 +313,7 @@ async function main(): Promise<void> {
       await rollback(serviceName);
       break;
     default:
-      await deploy(serviceName);
+      await deploy(serviceName, healthCheckCmd);
   }
 }
 

@@ -4,6 +4,20 @@ Infrastructure scripts for Sweden Indoor Golf services running on `app.swedenind
 
 A simple, template-based approach to managing multiple Bun/TypeScript services behind Caddy on a single VPS.
 
+## Documentation
+
+### For Infrastructure Operators
+- **[CLAUDE.md](./CLAUDE.md)** - Complete infrastructure documentation with architecture details and command reference
+
+### For Service Developers
+- **[SERVICE-DATABASE-GUIDE.md](./SERVICE-DATABASE-GUIDE.md)** - Guide for adding database migration support to your service (optional)
+
+### For AI Agents
+- **[AI-AGENT-SETUP-INSTRUCTIONS.md](./AI-AGENT-SETUP-INSTRUCTIONS.md)** - Step-by-step procedural instructions for setting up migrations
+
+### Templates
+- **[deploy.json.example](./deploy.json.example)** - Service deployment configuration template
+
 ## Philosophy
 
 - **Convention over configuration** — folder name = service name = systemd unit = Caddy path
@@ -65,6 +79,18 @@ deploy_status               # Check service status
 deploy_rollback             # Revert to previous commit
 ```
 
+### Database Development (Optional)
+
+Services can optionally enable database migrations:
+
+```bash
+db_pull                     # Download production database
+db_migrate_test             # Test migration locally
+db_validate_test            # Validate migration
+```
+
+See [SERVICE-DATABASE-GUIDE.md](./SERVICE-DATABASE-GUIDE.md) for setup instructions.
+
 ### Updating Infrastructure Scripts
 
 ```bash
@@ -77,13 +103,17 @@ infra_pull                           # Update local from remote
 ```
 sig-infra/
 ├── README.md
+├── CLAUDE.md                          # Infrastructure documentation
+├── SERVICE-DATABASE-GUIDE.md          # Guide for service developers
+├── AI-AGENT-SETUP-INSTRUCTIONS.md     # Instructions for AI agents
+├── deploy.json.example                # Service config template
 ├── .gitignore
 ├── server/
-│   ├── generate.ts         # Caddyfile generator
-│   ├── deploy.ts           # Deployment orchestration
-│   └── services.json       # Service registry (source of truth)
+│   ├── generate.ts                    # Caddyfile generator
+│   ├── deploy.ts                      # Deployment orchestration
+│   └── services.json                  # Service registry (source of truth)
 └── shell/
-    └── functions.zsh       # Local shell functions (sourced by .zshrc)
+    └── functions.zsh                  # Local shell functions (sourced by .zshrc)
 ```
 
 ### On Server
@@ -150,6 +180,7 @@ Toggling maintenance swaps the Caddy block from `reverse_proxy` to serving a sta
 
 ### Deployment Flow
 
+**Standard deployment:**
 ```
 Local                           Server
 ─────                           ──────
@@ -163,6 +194,25 @@ Local                           Server
                                 8. Maintenance OFF
                                 ←────────────────── Success/Fail
 9. Tail logs
+```
+
+**With database migration** (optional):
+```
+Local                           Server
+─────                           ──────
+1. Download DB
+2. Migrate locally
+3. Validate
+4. Upload DB ─────────────────→ Backup & activate
+5. Build (optional)
+6. Git push ──────────────────→
+                                7. Maintenance ON
+                                8. Git pull
+                                9. Systemctl restart
+                                10. Health check
+                                11. Rollback if failed
+                                12. Maintenance OFF
+13. Tail logs
 ```
 
 ## Requirements

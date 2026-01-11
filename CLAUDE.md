@@ -71,6 +71,143 @@ Local                           Server
 
 If deployment fails, service stays in maintenance mode until manually fixed.
 
+## Database Migration Support
+
+Services can optionally include database migration and validation in their deployment workflow. Migrations run **locally** before deployment, with automatic backup and rollback on failure.
+
+**For service developers:** See [SERVICE-DATABASE-GUIDE.md](./SERVICE-DATABASE-GUIDE.md) for complete implementation instructions.
+
+**For AI agents:** See [AI-AGENT-SETUP-INSTRUCTIONS.md](./AI-AGENT-SETUP-INSTRUCTIONS.md) for step-by-step procedural instructions to add migration support to a service.
+
+### Configuration (deploy.json)
+
+Each service can include a `deploy.json` at the repository root:
+
+```json
+{
+  "database": {
+    "path": "data/db.sqlite",           // Path on server (relative to /srv/{service}/)
+    "migrate": "bun run db:migrate",    // Migration command (runs locally)
+    "validate": "bun run db:health"     // Validation command (runs locally)
+  },
+  "healthCheck": "curl -f http://localhost:3000/health"  // Optional custom health check
+}
+```
+
+**Key principles:**
+- Migration/validation commands run in **project root** working directory
+- Database path provided via **DB_PATH environment variable**: `DB_PATH=deploy-tmp/db.sqlite`
+- Commands are project-specific (each service defines its own)
+- Health check is optional (falls back to TCP port check if not specified)
+
+### Enhanced Deployment Flow (with database)
+
+```
+Local                           Server
+─────                           ──────
+1. Check for deploy.json
+2. If database config exists:
+   a. Download DB to deploy-tmp/
+   b. Run migration locally
+   c. Run validation locally
+   d. If valid:                 → Backup DB (rotate: .1→.2, current→.1)
+   e. Upload migrated DB        → Receive and activate new DB
+3. Optional build (if .build exists)
+4. Git commit + push  ────────→
+                                5. Maintenance mode ON
+                                6. Git pull (as service user)
+                                7. Systemctl restart
+                                8. Health check (TCP or custom)
+                                9. Maintenance mode OFF
+                                ←────────────────── Success/Fail
+                                10. If fail: rollback DB + code
+11. Tail logs via journalctl
+```
+
+### Database Backup Strategy
+
+Each deployment creates numbered backups on the server:
+- `db.sqlite.backup.1` - Latest backup (from current deployment)
+- `db.sqlite.backup.2` - Previous backup (from prior deployment)
+
+Rotation happens automatically:
+1. `backup.1` → `backup.2` (if exists)
+2. `current` → `backup.1`
+3. `uploaded` → `current`
+
+### Local Development Workflow
+
+Test migrations against production data locally:
+
+```bash
+cd ~/projects/my-service
+
+db_pull                    # Download prod DB to deploy-tmp/db.sqlite
+db_migrate_test            # Run migration on downloaded DB (sets DB_PATH)
+db_validate_test           # Validate migration
+
+# Manually copy deploy-tmp/db.sqlite to your dev DB location if desired
+# Or point your dev server configuration at deploy-tmp/
+```
+
+### Example Service Setup
+
+**1. Create deploy.json:**
+```json
+{
+  "database": {
+    "path": "data/db.sqlite",
+    "migrate": "bun run db:migrate",
+    "validate": "bun run db:health"
+  },
+  "healthCheck": "curl -f http://localhost:3000/health"
+}
+```
+
+**2. Add migration script to package.json:**
+```json
+{
+  "scripts": {
+    "db:migrate": "bun ./scripts/migrate.ts",
+    "db:health": "bun ./scripts/health.ts"
+  }
+}
+```
+
+**3. Create migration script (scripts/migrate.ts):**
+```typescript
+// Reads DB_PATH environment variable
+const dbPath = process.env.DB_PATH || "data/db.sqlite";
+const db = new Database(dbPath);
+
+// Run your migrations
+db.run("ALTER TABLE users ADD COLUMN email TEXT");
+console.log("Migration completed");
+```
+
+**4. Create validation script (scripts/health.ts):**
+```typescript
+const dbPath = process.env.DB_PATH || "data/db.sqlite";
+const db = new Database(dbPath);
+
+// Verify schema
+const result = db.query("PRAGMA table_info(users)").all();
+const hasEmail = result.some(col => col.name === "email");
+
+if (!hasEmail) {
+  console.error("Validation failed: email column missing");
+  process.exit(1);
+}
+
+console.log("Validation passed");
+```
+
+**5. Update .gitignore:**
+```
+deploy-tmp/
+*.local-backup
+```
+
 ## Common Commands
 
 ### Development & Testing
@@ -111,6 +248,13 @@ deploy_status [service]     # Check service status
 deploy_rollback [service]   # Revert to previous commit
 ```
 
+**Database Development (requires deploy.json):**
+```bash
+db_pull [service]           # Download production database for local testing
+db_migrate_test             # Run migration on downloaded DB (sets DB_PATH env)
+db_validate_test            # Run validation on migrated DB (sets DB_PATH env)
+```
+
 **Maintenance (Direct server manipulation):**
 ```bash
 app_maint                   # Interactive service picker (uses fzf)
@@ -140,6 +284,7 @@ bun generate.ts maint my-service
 bun deploy.ts my-service
 bun deploy.ts my-service --status
 bun deploy.ts my-service --rollback
+bun deploy.ts my-service --health-check 'curl -f http://localhost:3000/health'
 ```
 
 **Server-side convenience functions** (in `server/.bashrc` for reference):
@@ -159,8 +304,12 @@ sig-infra/
 │   ├── services.json               # Service structure (tracked in git)
 │   ├── services-state.json.example # Template for operational state
 │   └── .bashrc                     # Reference copy of server bashrc (rfu/rbu helpers)
-└── shell/
-    └── functions.zsh               # Local shell wrappers (SSH to server)
+├── shell/
+│   └── functions.zsh               # Local shell wrappers (SSH to server)
+├── deploy.json.example             # Template for service deployment config
+├── CLAUDE.md                       # Infrastructure documentation (this file)
+├── SERVICE-DATABASE-GUIDE.md       # Guide for service developers
+└── AI-AGENT-SETUP-INSTRUCTIONS.md  # Step-by-step instructions for AI agents
 ```
 
 ### Server Environment
