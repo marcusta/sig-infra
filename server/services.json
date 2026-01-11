@@ -23,6 +23,7 @@
   },
   "sig-web3": {
     "port": 4005,
-    "stripPath": false
+    "stripPath": false,
+    "healthCheckPath": ""
   }
 }

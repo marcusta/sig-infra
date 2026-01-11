@@ -226,24 +226,25 @@ function formatStatus(status: ServiceStatus, showPort: boolean = false): string 
   const httpDetail = status.httpStatus ? ` (${status.httpStatus})` : "";
 
   if (showPort) {
-    return `${icon} ${status.name.padEnd(20)} :${String(status.port).padEnd(5)} ${config.padEnd(6)} ${systemd} Port:${port} HTTP:${http}${httpDetail}`;
+    // Format: 🟢 service-name      3001  LIVE    ACTIVE   ✓     ✓ (200)
+    return `${icon} ${status.name.padEnd(18)} ${String(status.port).padStart(4)}  ${config.padEnd(6)} ${systemd} ${port.padEnd(5)} ${http}${httpDetail}`;
   }
 
   return `${icon} ${status.name.padEnd(20)} ${config.padEnd(6)} ${systemd} Port:${port} HTTP:${http}${httpDetail}`;
 }
 
 function printStatusTable(statuses: ServiceStatus[]): void {
-  console.log("\n╔════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║                            SERVICE STATUS                                  ║");
-  console.log("╠════════════════════════════════════════════════════════════════════════════╣");
-  console.log("║ SERVICE              PORT   CONFIG  SYSTEMD  PORT  HTTP                    ║");
-  console.log("╟────────────────────────────────────────────────────────────────────────────╢");
+  console.log("\n╔══════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                          SERVICE STATUS                                  ║");
+  console.log("╠══════════════════════════════════════════════════════════════════════════╣");
+  console.log("║   SERVICE            PORT  CONFIG  SYSTEMD  PORT  HTTP                   ║");
+  console.log("╟──────────────────────────────────────────────────────────────────────────╢");
 
   for (const status of statuses.sort((a, b) => a.name.localeCompare(b.name))) {
-    console.log(`║ ${formatStatus(status, true).padEnd(74)} ║`);
+    console.log(`║ ${formatStatus(status, true).padEnd(72)} ║`);
   }
 
-  console.log("╚════════════════════════════════════════════════════════════════════════════╝");
+  console.log("╚══════════════════════════════════════════════════════════════════════════╝");
 
   // Summary
   const healthy = statuses.filter(
