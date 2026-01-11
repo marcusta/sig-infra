@@ -186,7 +186,19 @@ OUTER_EOF
 # =============================================================================
 
 caddy_list() {
-  ssh $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts list"
+  ssh $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun status.ts"
+}
+
+caddy_status() {
+  local service_name=$1
+
+  if [[ -z "$service_name" ]]; then
+    # No service specified, show all
+    caddy_list
+  else
+    # Show specific service
+    ssh $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun status.ts $service_name"
+  fi
 }
 
 caddy_view() {
@@ -642,7 +654,8 @@ helpme() {
   echo "service_create : Interactive wizard to create new service"
   echo ""
   echo "--- CADDY MANAGEMENT ---"
-  echo "caddy_list     : List all services and their status"
+  echo "caddy_list     : List all services with comprehensive status"
+  echo "caddy_status   : Check specific service status (caddy_status <service>)"
   echo "caddy_add      : Add a new service (caddy_add <name> <port>)"
   echo "caddy_remove   : Remove a service from Caddy"
   echo "caddy_view     : View the generated Caddyfile"
@@ -707,6 +720,12 @@ _caddy_remove_completion() {
   _describe 'service' services
 }
 
+_caddy_status_completion() {
+  local -a services
+  services=(${(f)"$(_get_caddy_services)"})
+  _describe 'service' services
+}
+
 _caddy_regen_completion() {
   _arguments '1:option:(--dry-run)'
 }
@@ -719,6 +738,7 @@ _infra_push_completion() {
 compdef _app_maint_completion app_maint
 compdef _caddy_add_completion caddy_add
 compdef _caddy_remove_completion caddy_remove
+compdef _caddy_status_completion caddy_status
 compdef _caddy_regen_completion caddy_regen
 compdef _infra_push_completion infra_push
 compdef '_arguments "1:service:($(_get_caddy_services))"' deploy_status

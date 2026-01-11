@@ -51,10 +51,14 @@ source ~/dev/github/sig-infra/shell/functions.zsh
 
 ## Usage
 
-### Service Management
+### Service Status & Management
 
 ```bash
-caddy_list                  # List all services and status
+# Status checking
+caddy_list                  # Comprehensive status: config, systemd, port, HTTP
+caddy_status my-service     # Detailed status with diagnostic commands
+
+# Service management
 caddy_add my-api 3007       # Add new service
 caddy_remove my-api         # Remove service
 caddy_view                  # View generated Caddyfile

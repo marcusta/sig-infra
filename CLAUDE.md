@@ -71,6 +71,91 @@ Local                           Server
 
 If deployment fails, service stays in maintenance mode until manually fixed.
 
+## Service Status Monitoring
+
+The infrastructure includes comprehensive status checking for all services, going beyond just configuration to verify actual service health.
+
+### Status Checks Performed
+
+For each service, the system checks:
+
+1. **Configuration Status** (from `services.json` + `services-state.json`)
+   - Live or Maintenance mode
+   - Configured port
+
+2. **Systemd Status** (`systemctl is-active`)
+   - active, inactive, failed, or unknown
+   - Indicates if the service process is running
+
+3. **Port Availability** (`nc -z localhost {port}`)
+   - Checks if something is listening on the configured port
+   - Indicates if the service started successfully
+
+4. **HTTP Health** (`curl https://app.swedenindoorgolf.se/{service}/`)
+   - Tests full request path through Caddy
+   - Verifies service is responding to actual requests
+   - Reports HTTP status code
+
+### Status Display
+
+**All services overview:**
+```bash
+caddy_list  # or: ssh server 'cd /srv/infra/server && bun status.ts'
+```
+
+Shows formatted table:
+```
+╔════════════════════════════════════════════════════════════════════════╗
+║                          SERVICE STATUS                                ║
+╠════════════════════════════════════════════════════════════════════════╣
+║ SERVICE              CONFIG  SYSTEMD  PORT  HTTP                       ║
+╟────────────────────────────────────────────────────────────────────────╢
+║ 🟢 bookings           LIVE    ACTIVE    Port:✓ HTTP:✓ (200)            ║
+║ 🟢 golf-serie         LIVE    ACTIVE    Port:✓ HTTP:✓ (200)            ║
+║ 🚧 gsp                MAINT   ACTIVE    Port:✓ HTTP:✓ (503)            ║
+║ 🔴 mycal              LIVE    INACTIVE  Port:✗ HTTP:✗                  ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+Summary: 2 healthy, 1 maintenance, 1 issues
+```
+
+**Specific service details:**
+```bash
+caddy_status mycal  # or: ssh server 'cd /srv/infra/server && bun status.ts mycal'
+```
+
+Shows detailed information with diagnostic commands:
+```
+Service: mycal
+────────────────────────────────────────────────────────────
+URL:        https://app.swedenindoorgolf.se/mycal/
+Port:       3005
+Config:     🟢 Live
+Systemd:    🔴 inactive
+Port Open:  🔴 No (nc -z localhost 3005)
+HTTP OK:    🔴 No
+
+Commands:
+  sudo systemctl status mycal
+  sudo journalctl -u mycal -n 50
+  sudo systemctl restart mycal
+```
+
+### Status Icons
+
+- 🟢 **Green** - Service is fully healthy (live, active, port open, HTTP responding)
+- 🚧 **Orange** - Service is in maintenance mode (expected state)
+- 🔴 **Red** - Service has issues (live but systemd inactive, port closed, or HTTP failing)
+
+### JSON Output
+
+For scripting and automation:
+```bash
+ssh server 'cd /srv/infra/server && bun status.ts --json' | jq '.'
+```
+
+Returns structured JSON with all status information for each service.
+
 ## Database Migration Support
 
 Services can optionally include database migration and validation in their deployment workflow. Migrations run **locally** before deployment, with automatic backup and rollback on failure.
@@ -232,9 +317,16 @@ service_create              # Interactive wizard to create new service
                             # - Adds to Caddy routing
 ```
 
+**Service Status:**
+```bash
+caddy_list                  # Comprehensive status of all services
+                            # Shows: config, systemd, port, HTTP health
+caddy_status my-service     # Detailed status of specific service
+                            # Includes diagnostic commands
+```
+
 **Service Management (GitOps - modifies local, commits, pushes):**
 ```bash
-caddy_list                  # List all services and status
 caddy_add my-api 3007       # Add new service to routing (GitOps)
 caddy_remove my-api         # Remove service from Caddy (GitOps)
 caddy_view                  # View generated Caddyfile
@@ -275,8 +367,13 @@ infra_status                # Compare local vs server
 ```bash
 cd /srv/infra/server
 
+# Service status
+bun status.ts                # Comprehensive status of all services
+bun status.ts my-service     # Detailed status of specific service
+bun status.ts --json         # JSON output for scripting
+
 # Service management
-bun generate.ts list
+bun generate.ts list         # Simple config list (legacy)
 bun generate.ts add my-service 3008
 bun generate.ts maint my-service
 
@@ -299,6 +396,7 @@ These are useful for manual debugging/operations on the server.
 ```
 sig-infra/
 ├── server/
+│   ├── status.ts                   # Service status checker (systemd, port, HTTP)
 │   ├── generate.ts                 # Caddyfile generator (add/remove/maint/list)
 │   ├── deploy.ts                   # Server-side deployment orchestrator
 │   ├── services.json               # Service structure (tracked in git)
