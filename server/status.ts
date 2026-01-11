@@ -26,6 +26,7 @@ interface ServiceStructure {
   port: number;
   stripPath?: boolean;
   description?: string;
+  healthCheckPath?: string; // optional path for HTTP health check (e.g., "/health" or "/status.html")
 }
 
 // State: live/maintenance (server-only)
@@ -153,9 +154,11 @@ async function checkPortOpen(port: number): Promise<boolean> {
 }
 
 async function checkHttpHealth(
-  serviceName: string
+  serviceName: string,
+  healthCheckPath?: string
 ): Promise<{ ok: boolean; status?: number }> {
-  const url = `https://${DOMAIN}/${serviceName}/`;
+  const path = healthCheckPath || "/";
+  const url = `https://${DOMAIN}/${serviceName}${path}`;
   try {
     // Use curl with short timeout, follow redirects
     const result = await $`curl -f -s -o /dev/null -w '%{http_code}' --max-time 3 ${url}`.text();
@@ -173,7 +176,7 @@ async function getServiceStatus(
   const [systemdResult, portOpen, httpHealth] = await Promise.all([
     checkSystemdStatus(name),
     checkPortOpen(config.port),
-    checkHttpHealth(name),
+    checkHttpHealth(name, config.healthCheckPath),
   ]);
 
   return {

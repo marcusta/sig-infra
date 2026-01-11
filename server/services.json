@@ -12,7 +12,8 @@
     "port": 3002
   },
   "sig-status": {
-    "port": 3004
+    "port": 3004,
+    "healthCheckPath": "/status.html"
   },
   "golf-serie": {
     "port": 3010
