@@ -193,11 +193,11 @@ async function reloadCaddy(dryRun: boolean): Promise<void> {
 
   try {
     await $`sudo docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile`.quiet();
-    await $`sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force`.quiet();
+    await $`sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force`;
     console.log("✅ Caddy reloaded");
   } catch (error) {
     console.error("❌ Caddy reload failed. Check logs with: sudo docker logs caddy --tail 20");
-    process.exit(1);
+    throw error;
   }
 }
 
