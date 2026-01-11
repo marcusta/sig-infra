@@ -355,15 +355,16 @@ _deploy_db_backup_and_upload() {
   }
 
   echo "📤 Uploading migrated database..."
-  scp "deploy-tmp/db.sqlite" "$SIG_SERVER:/srv/$service_name/$db_path.new" || {
+  # Upload to tmp first (marcus can write there), then move with sudo
+  scp "deploy-tmp/db.sqlite" "$SIG_SERVER:/tmp/$service_name-db.new" || {
     echo "❌ Failed to upload database"
     return 1
   }
 
-  ssh $SIG_SERVER "cd /srv/$service_name && \
-    sudo chown $service_name:$service_name $db_path.new && \
-    sudo -u $service_name mv $db_path.new $db_path" || {
-    echo "❌ Failed to swap database"
+  ssh -t $SIG_SERVER "sudo mv /tmp/$service_name-db.new /srv/$service_name/$db_path.new && \
+    sudo chown $service_name:$service_name /srv/$service_name/$db_path.new && \
+    sudo -u $service_name mv /srv/$service_name/$db_path.new /srv/$service_name/$db_path" || {
+    echo "❌ Failed to move database into place"
     return 1
   }
 
