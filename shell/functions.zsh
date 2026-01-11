@@ -348,9 +348,9 @@ _deploy_db_backup_and_upload() {
   local db_path=$2
 
   echo "💾 Backing up database on server..."
-  ssh $SIG_SERVER "cd /srv/$service_name && \
-    if [ -f $db_path.backup.1 ]; then sudo -u $service_name mv $db_path.backup.1 $db_path.backup.2; fi && \
-    if [ -f $db_path ]; then sudo -u $service_name cp $db_path $db_path.backup.1; fi" || {
+  ssh $SIG_SERVER "sudo -u $service_name bash -c 'cd /srv/$service_name && \
+    if [ -f $db_path.backup.1 ]; then mv $db_path.backup.1 $db_path.backup.2; fi && \
+    if [ -f $db_path ]; then cp $db_path $db_path.backup.1; fi'" || {
     echo "❌ Failed to backup database"
     return 1
   }
