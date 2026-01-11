@@ -41,6 +41,7 @@ interface ServiceConfig extends ServiceStructure {
 interface ServiceStatus {
   name: string;
   port: number;
+  stripPath: boolean;
   config: "live" | "maintenance";
   systemd: "active" | "inactive" | "failed" | "unknown";
   systemdUnit?: string; // The actual systemd unit name found
@@ -178,6 +179,7 @@ async function getServiceStatus(
   return {
     name,
     port: config.port,
+    stripPath: config.stripPath !== false, // default true
     config: config.live ? "live" : "maintenance",
     systemd: systemdResult.status as ServiceStatus["systemd"],
     systemdUnit: systemdResult.unit,
@@ -212,7 +214,7 @@ function getStatusIcon(status: ServiceStatus): string {
   return "🔴";
 }
 
-function formatStatus(status: ServiceStatus): string {
+function formatStatus(status: ServiceStatus, showPort: boolean = false): string {
   const icon = getStatusIcon(status);
   const config = status.config === "live" ? "LIVE" : "MAINT";
   const systemd = status.systemd.toUpperCase().padEnd(8);
@@ -220,21 +222,25 @@ function formatStatus(status: ServiceStatus): string {
   const http = status.httpOk ? "✓" : "✗";
   const httpDetail = status.httpStatus ? ` (${status.httpStatus})` : "";
 
+  if (showPort) {
+    return `${icon} ${status.name.padEnd(20)} :${String(status.port).padEnd(5)} ${config.padEnd(6)} ${systemd} Port:${port} HTTP:${http}${httpDetail}`;
+  }
+
   return `${icon} ${status.name.padEnd(20)} ${config.padEnd(6)} ${systemd} Port:${port} HTTP:${http}${httpDetail}`;
 }
 
 function printStatusTable(statuses: ServiceStatus[]): void {
-  console.log("\n╔════════════════════════════════════════════════════════════════════════╗");
-  console.log("║                          SERVICE STATUS                                ║");
-  console.log("╠════════════════════════════════════════════════════════════════════════╣");
-  console.log("║ SERVICE              CONFIG  SYSTEMD  PORT  HTTP                       ║");
-  console.log("╟────────────────────────────────────────────────────────────────────────╢");
+  console.log("\n╔════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                            SERVICE STATUS                                  ║");
+  console.log("╠════════════════════════════════════════════════════════════════════════════╣");
+  console.log("║ SERVICE              PORT   CONFIG  SYSTEMD  PORT  HTTP                    ║");
+  console.log("╟────────────────────────────────────────────────────────────────────────────╢");
 
   for (const status of statuses.sort((a, b) => a.name.localeCompare(b.name))) {
-    console.log(`║ ${formatStatus(status).padEnd(70)} ║`);
+    console.log(`║ ${formatStatus(status, true).padEnd(74)} ║`);
   }
 
-  console.log("╚════════════════════════════════════════════════════════════════════════╝");
+  console.log("╚════════════════════════════════════════════════════════════════════════════╝");
 
   // Summary
   const healthy = statuses.filter(
@@ -288,6 +294,7 @@ function printDetailedStatus(status: ServiceStatus): void {
   console.log("─".repeat(60));
   console.log(`URL:        ${status.url}`);
   console.log(`Port:       ${status.port}`);
+  console.log(`Path Mode:  ${status.stripPath ? "handle_path (strips /${status.name}/)" : "handle (preserves path)"}`);
   console.log(`Config:     ${status.config === "live" ? "🟢 Live" : "🚧 Maintenance"}`);
   console.log(
     `Systemd:    ${status.systemd === "active" ? "🟢" : "🔴"} ${status.systemd}${status.systemdUnit && status.systemdUnit !== status.name ? ` (${status.systemdUnit})` : ""}`
