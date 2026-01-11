@@ -1,27 +1,26 @@
 {
   "bookings": {
-    "port": 3001
+    "live": true
   },
   "gsp": {
-    "port": 3000
+    "live": true
   },
   "mycal": {
-    "port": 3005
+    "live": true
   },
   "web": {
-    "port": 3002
+    "live": true
   },
   "sig-status": {
-    "port": 3004
+    "live": true
   },
   "golf-serie": {
-    "port": 3010
+    "live": true
   },
   "golf-improver": {
-    "port": 3100
+    "live": true
   },
   "sig-web3": {
-    "port": 4005,
-    "stripPath": false
+    "live": true
   }
 }

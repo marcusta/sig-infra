@@ -1,7 +1,11 @@
 #!/usr/bin/env bun
 /**
  * Server-side deployment script
- * 
+ *
+ * Two-file architecture:
+ * - services.json: Service structure (port, stripPath) - tracked in git
+ * - services-state.json: Operational state (live/maintenance) - server-only
+ *
  * Usage:
  *   bun deploy.ts <service-name>           # Full deploy
  *   bun deploy.ts <service-name> --status  # Check service status
@@ -11,47 +15,86 @@
 import { $ } from "bun";
 
 const SCRIPT_DIR = import.meta.dir;
-const SERVICES_FILE = `${SCRIPT_DIR}/services.json`;
+const SERVICES_STRUCTURE_FILE = `${SCRIPT_DIR}/services.json`;
+const SERVICES_STATE_FILE = `${SCRIPT_DIR}/services-state.json`;
 const CADDY_DIR = SCRIPT_DIR; // generate.ts is in same directory
 
-interface ServiceConfig {
+// Structure: port, stripPath (tracked in git)
+interface ServiceStructure {
   port: number;
-  live: boolean;
   stripPath?: boolean;
 }
 
+// State: live/maintenance (server-only)
+interface ServiceState {
+  live: boolean;
+}
+
+// Combined
+interface ServiceConfig extends ServiceStructure {
+  live: boolean;
+}
+
+type ServicesStructure = Record<string, ServiceStructure>;
+type ServicesState = Record<string, ServiceState>;
 type Services = Record<string, ServiceConfig>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function loadServices(): Promise<Services> {
-  const file = Bun.file(SERVICES_FILE);
+async function loadServicesStructure(): Promise<ServicesStructure> {
+  const file = Bun.file(SERVICES_STRUCTURE_FILE);
   if (!(await file.exists())) {
-    throw new Error(`${SERVICES_FILE} not found`);
+    throw new Error(`${SERVICES_STRUCTURE_FILE} not found`);
   }
   return file.json();
 }
 
-async function saveServices(services: Services): Promise<void> {
-  const content = JSON.stringify(services, null, 2) + "\n";
-  const tempFile = "/tmp/services.json.new";
+async function loadServicesState(): Promise<ServicesState> {
+  const file = Bun.file(SERVICES_STATE_FILE);
+  if (!(await file.exists())) {
+    return {}; // Default to empty if state file doesn't exist
+  }
+  return file.json();
+}
+
+async function loadServices(): Promise<Services> {
+  const structure = await loadServicesStructure();
+  const state = await loadServicesState();
+
+  // Merge: structure + state, defaulting to live: true
+  const merged: Services = {};
+  for (const [name, config] of Object.entries(structure)) {
+    merged[name] = {
+      ...config,
+      live: state[name]?.live ?? true,
+    };
+  }
+
+  return merged;
+}
+
+async function saveServicesState(state: ServicesState): Promise<void> {
+  const content = JSON.stringify(state, null, 2) + "\n";
+  const tempFile = "/tmp/services-state.json.new";
   await Bun.write(tempFile, content);
-  await $`cat ${tempFile} | sudo tee ${SERVICES_FILE} > /dev/null`;
+  await $`cat ${tempFile} | sudo tee ${SERVICES_STATE_FILE} > /dev/null`;
   await $`rm ${tempFile}`;
 }
 
 async function setMaintenance(serviceName: string, enabled: boolean): Promise<void> {
   const services = await loadServices();
-  
+
   if (!services[serviceName]) {
     throw new Error(`Service '${serviceName}' not found in services.json`);
   }
-  
-  services[serviceName].live = !enabled;
-  await saveServices(services);
-  
+
+  // Update state file only
+  const state = await loadServicesState();
+  state[serviceName] = { live: !enabled };
+  await saveServicesState(state);
+
   // Regenerate and reload Caddy
   await $`cd ${CADDY_DIR} && bun generate.ts`.quiet();
 }

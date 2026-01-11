@@ -1,7 +1,11 @@
 #!/usr/bin/env bun
 /**
  * Caddyfile Generator
- * 
+ *
+ * Two-file architecture:
+ * - services.json: Service structure (port, stripPath) - tracked in git
+ * - services-state.json: Operational state (live/maintenance) - server-only
+ *
  * Usage:
  *   bun generate.ts                    # Generate and reload
  *   bun generate.ts --dry-run          # Preview without writing
@@ -14,35 +18,81 @@
 import { $ } from "bun";
 
 const SCRIPT_DIR = import.meta.dir;
-const SERVICES_FILE = `${SCRIPT_DIR}/services.json`;
+const SERVICES_STRUCTURE_FILE = `${SCRIPT_DIR}/services.json`;
+const SERVICES_STATE_FILE = `${SCRIPT_DIR}/services-state.json`;
 const CADDYFILE_PATH = "/srv/caddy/config/Caddyfile";
 const TEMP_FILE = "/tmp/Caddyfile.new";
 const DOMAIN = "app.swedenindoorgolf.se";
 const MAINTENANCE_ROOT = "/maintenance";
 
-interface ServiceConfig {
+// Structure: port, stripPath (tracked in git)
+interface ServiceStructure {
   port: number;
-  live: boolean;
-  description?: string;
   stripPath?: boolean; // default true (handle_path), false = handle (keep path)
+  description?: string;
 }
 
+// State: live/maintenance (server-only)
+interface ServiceState {
+  live: boolean;
+}
+
+// Combined for Caddyfile generation
+interface ServiceConfig extends ServiceStructure {
+  live: boolean;
+}
+
+type ServicesStructure = Record<string, ServiceStructure>;
+type ServicesState = Record<string, ServiceState>;
 type Services = Record<string, ServiceConfig>;
 
-async function loadServices(): Promise<Services> {
-  const file = Bun.file(SERVICES_FILE);
+async function loadServicesStructure(): Promise<ServicesStructure> {
+  const file = Bun.file(SERVICES_STRUCTURE_FILE);
   if (!(await file.exists())) {
-    console.error(`❌ ${SERVICES_FILE} not found. Create it first.`);
+    console.error(`❌ ${SERVICES_STRUCTURE_FILE} not found. Create it first.`);
     process.exit(1);
   }
   return file.json();
 }
 
-async function saveServices(services: Services): Promise<void> {
+async function loadServicesState(): Promise<ServicesState> {
+  const file = Bun.file(SERVICES_STATE_FILE);
+  if (!(await file.exists())) {
+    // If state file doesn't exist, return empty object (will default to live: true)
+    return {};
+  }
+  return file.json();
+}
+
+async function loadServices(): Promise<Services> {
+  const structure = await loadServicesStructure();
+  const state = await loadServicesState();
+
+  // Merge: structure + state, defaulting to live: true
+  const merged: Services = {};
+  for (const [name, config] of Object.entries(structure)) {
+    merged[name] = {
+      ...config,
+      live: state[name]?.live ?? true, // Default to live if not in state file
+    };
+  }
+
+  return merged;
+}
+
+async function saveServicesStructure(services: ServicesStructure): Promise<void> {
   const content = JSON.stringify(services, null, 2) + "\n";
   const tempFile = "/tmp/services.json.new";
   await Bun.write(tempFile, content);
-  await $`cat ${tempFile} | sudo tee ${SERVICES_FILE} > /dev/null`;
+  await $`cat ${tempFile} | sudo tee ${SERVICES_STRUCTURE_FILE} > /dev/null`;
+  await $`rm ${tempFile}`;
+}
+
+async function saveServicesState(state: ServicesState): Promise<void> {
+  const content = JSON.stringify(state, null, 2) + "\n";
+  const tempFile = "/tmp/services-state.json.new";
+  await Bun.write(tempFile, content);
+  await $`cat ${tempFile} | sudo tee ${SERVICES_STATE_FILE} > /dev/null`;
   await $`rm ${tempFile}`;
 }
 
@@ -190,12 +240,15 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      services[serviceName].live = !services[serviceName].live;
-      const newState = services[serviceName].live ? "🟢 LIVE" : "🚧 MAINTENANCE";
+      // Toggle state in services-state.json only
+      const state = await loadServicesState();
+      const currentLive = state[serviceName]?.live ?? true;
+      state[serviceName] = { live: !currentLive };
+      const newState = state[serviceName].live ? "🟢 LIVE" : "🚧 MAINTENANCE";
       console.log(`Toggling ${serviceName} → ${newState}`);
 
       if (!dryRun) {
-        await saveServices(services);
+        await saveServicesState(state);
       }
       break;
     }
@@ -217,11 +270,13 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      services[serviceName] = { port, live: true };
+      // Add to structure file only (state defaults to live: true)
+      const structure = await loadServicesStructure();
+      structure[serviceName] = { port };
       console.log(`Adding ${serviceName} on port ${port}`);
 
       if (!dryRun) {
-        await saveServices(services);
+        await saveServicesStructure(structure);
       }
       break;
     }
@@ -237,11 +292,20 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      delete services[serviceName];
+      // Remove from structure file
+      const structure = await loadServicesStructure();
+      delete structure[serviceName];
       console.log(`Removing ${serviceName}`);
 
       if (!dryRun) {
-        await saveServices(services);
+        await saveServicesStructure(structure);
+
+        // Also clean up state file if it exists
+        const state = await loadServicesState();
+        if (state[serviceName]) {
+          delete state[serviceName];
+          await saveServicesState(state);
+        }
       }
       break;
     }

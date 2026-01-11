@@ -24,7 +24,7 @@ sudo chown -R marcus:marcus infra
 ### Local (Mac)
 
 ```bash
-cd ~/projects
+cd ~/dev/github
 git clone https://github.com/marcusta/sig-infra.git
 ```
 
@@ -32,7 +32,7 @@ Add to `~/.zshrc`:
 
 ```bash
 # Sweden Indoor Golf infrastructure
-source ~/projects/sig-infra/shell/functions.zsh
+source ~/dev/github/sig-infra/shell/functions.zsh
 ```
 
 ## Usage
@@ -42,7 +42,7 @@ source ~/projects/sig-infra/shell/functions.zsh
 ```bash
 caddy_list                  # List all services and status
 caddy_add my-api 3007       # Add new service
-caddy_remove my-api         # Remove service  
+caddy_remove my-api         # Remove service
 caddy_view                  # View generated Caddyfile
 caddy_regen --dry-run       # Preview Caddyfile regeneration
 ```
@@ -107,12 +107,14 @@ sig-infra/
 ## Adding a New Service
 
 1. Create the service on the server:
+
    ```bash
    cd /srv
    sudo create_and_clone_repo  # Interactive setup
    ```
 
 2. Add to Caddy:
+
    ```bash
    caddy_add my-service 3008
    ```
@@ -130,6 +132,7 @@ sig-infra/
 Instead of editing Caddyfile directly (error-prone), we:
 
 1. Define services in `services.json`:
+
    ```json
    {
      "golf-serie": { "port": 3010, "live": true },
@@ -152,7 +155,7 @@ Local                           Server
 ─────                           ──────
 1. Build (optional)
 2. Git commit
-3. Git push ──────────────────→ 
+3. Git push ──────────────────→
                                 4. Maintenance ON
                                 5. Git pull
                                 6. Systemctl restart

@@ -200,7 +200,37 @@ caddy_add() {
   # Strip leading slash if present
   path_segment="${path_segment#/}"
 
-  ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts add $path_segment $port"
+  echo "🔧 Adding $path_segment to Caddy routing (GitOps mode)..."
+
+  # Navigate to infra repo
+  cd "$SIG_INFRA_LOCAL" || { echo "❌ Can't find $SIG_INFRA_LOCAL"; return 1; }
+
+  # Check if service already exists
+  if jq -e ".[\"$path_segment\"]" server/services.json > /dev/null 2>&1; then
+    echo "❌ Service '$path_segment' already exists"
+    return 1
+  fi
+
+  # Check if port is already in use
+  if jq -e ".[] | select(.port == $port)" server/services.json > /dev/null 2>&1; then
+    echo "❌ Port $port already in use"
+    return 1
+  fi
+
+  # Add service to services.json using jq
+  jq ". + {\"$path_segment\": {\"port\": $port}}" server/services.json > server/services.json.tmp
+  mv server/services.json.tmp server/services.json
+
+  # Commit and push
+  git add server/services.json
+  git commit -m "Add $path_segment to Caddy (port $port)"
+  git push origin main || { echo "❌ Push failed"; return 1; }
+
+  # Pull on server and regenerate
+  echo "🔄 Updating server..."
+  ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE && git pull && cd server && bun generate.ts"
+
+  echo "✅ $path_segment added successfully"
 }
 
 caddy_remove() {
@@ -216,7 +246,31 @@ caddy_remove() {
   read -r "confirm?Remove $service_name from Caddy? (y/n): "
   [[ "$confirm" != "y" ]] && { echo "Cancelled."; return 0; }
 
-  ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts remove $service_name"
+  echo "🔧 Removing $service_name from Caddy routing (GitOps mode)..."
+
+  # Navigate to infra repo
+  cd "$SIG_INFRA_LOCAL" || { echo "❌ Can't find $SIG_INFRA_LOCAL"; return 1; }
+
+  # Check if service exists
+  if ! jq -e ".[\"$service_name\"]" server/services.json > /dev/null 2>&1; then
+    echo "❌ Service '$service_name' not found"
+    return 1
+  fi
+
+  # Remove service from services.json using jq
+  jq "del(.[\"$service_name\"])" server/services.json > server/services.json.tmp
+  mv server/services.json.tmp server/services.json
+
+  # Commit and push
+  git add server/services.json
+  git commit -m "Remove $service_name from Caddy"
+  git push origin main || { echo "❌ Push failed"; return 1; }
+
+  # Pull on server and regenerate (also cleans up state file)
+  echo "🔄 Updating server..."
+  ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE && git pull && cd server && bun generate.ts"
+
+  echo "✅ $service_name removed successfully"
 }
 
 caddy_regen() {
@@ -242,10 +296,20 @@ app_maint() {
   # Interactive mode if no service specified
   if [[ -z "$service_name" ]]; then
     echo "🔍 Fetching services..."
-    local selection=$(ssh $SIG_SERVER "cat $SIG_INFRA_REMOTE/server/services.json" | \
-      jq -r 'to_entries[] | "\(if .value.live then "🟢 LIVE " else "🚧 MAINT" end)  \(.key)"' | \
-      fzf --header "Select service to toggle" --reverse)
-    
+    # Use a temporary script on server to merge structure + state
+    local selection=$(ssh $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun -e '
+      const structure = await Bun.file(\"services.json\").json();
+      const state = await Bun.file(\"services-state.json\").exists()
+        ? await Bun.file(\"services-state.json\").json()
+        : {};
+
+      for (const [name, config] of Object.entries(structure).sort()) {
+        const live = state[name]?.live ?? true;
+        const status = live ? \"🟢 LIVE \" : \"🚧 MAINT\";
+        console.log(\`\${status}  \${name}\`);
+      }
+    '" | fzf --header "Select service to toggle" --reverse)
+
     [[ -z "$selection" ]] && { echo "Cancelled."; return 0; }
     service_name=$(echo "$selection" | awk '{print $NF}')
   fi

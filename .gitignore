@@ -141,3 +141,6 @@ vite.config.ts.timestamp-*
 *.pem
 *.key
 secrets/
+
+# Operational state (server-only, see services-state.json.example)
+server/services-state.json
