@@ -249,6 +249,8 @@ async function main(): Promise<void> {
 
       if (!dryRun) {
         await saveServicesState(state);
+        // Reload services to pick up the new state
+        Object.assign(services, await loadServices());
       }
       break;
     }
