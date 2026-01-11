@@ -101,6 +101,9 @@ async function checkSystemdStatus(
     serviceName, // exact match (e.g., "golf-serie")
     `sig-${serviceName}`, // sig- prefix (e.g., "sig-gsp")
     `${serviceName}-server`, // -server suffix (e.g., "golf-improver-server")
+    `${serviceName.replace(/s$/, "")}-calculator`, // singular + calculator (e.g., "booking-calculator" from "bookings")
+    `sig-${serviceName.replace(/s$/, "")}`, // sig- prefix with singular (e.g., "sig-booking" from "bookings")
+    `gsp-calculator`, // specific for mycal → gsp-calculator mapping
   ];
 
   for (const pattern of patterns) {
