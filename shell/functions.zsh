@@ -40,6 +40,12 @@ infra_pull() {
   echo "✅ Local infrastructure updated"
 }
 
+infra_pull_remote() {
+  echo "📥 Pulling infrastructure changes on server..."
+  ssh $SIG_SERVER "cd $SIG_INFRA_REMOTE && git pull"
+  echo "✅ Server infrastructure updated"
+}
+
 infra_status() {
   echo "Local ($SIG_INFRA_LOCAL):"
   cd "$SIG_INFRA_LOCAL" && git status -s
@@ -424,9 +430,10 @@ helpme() {
   echo "app_maint      : Toggle maintenance mode"
   echo ""
   echo "--- INFRASTRUCTURE ---"
-  echo "infra_push     : Push infra changes to server"
-  echo "infra_pull     : Pull latest infra locally"
-  echo "infra_status   : Show local/server infra sync status"
+  echo "infra_push        : Push infra changes to server"
+  echo "infra_pull        : Pull latest infra locally"
+  echo "infra_pull_remote : Pull latest infra on server"
+  echo "infra_status      : Show local/server infra sync status"
   echo ""
   echo "--- REMOTE SERVER ---"
   echo "rtail [file]   : Tail logs on server"

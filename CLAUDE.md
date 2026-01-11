@@ -122,6 +122,7 @@ app_maint --dry-run my-api  # Preview toggle
 ```bash
 infra_push "message"        # Commit, push, and update server
 infra_pull                  # Update local from remote
+infra_pull_remote           # Update server from remote (useful after manual push)
 infra_status                # Compare local vs server
 ```
 
