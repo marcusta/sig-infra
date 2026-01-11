@@ -43,6 +43,7 @@ interface ServiceStatus {
   port: number;
   config: "live" | "maintenance";
   systemd: "active" | "inactive" | "failed" | "unknown";
+  systemdUnit?: string; // The actual systemd unit name found
   portOpen: boolean;
   httpOk: boolean;
   httpStatus?: number;
@@ -92,21 +93,50 @@ async function loadServices(): Promise<Services> {
 // Status Checks
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function checkSystemdStatus(serviceName: string): Promise<string> {
-  try {
-    const result = await $`systemctl is-active ${serviceName}`.text();
-    return result.trim();
-  } catch (error) {
-    // systemctl returns non-zero for inactive/failed services
-    // Check if it's failed specifically
+async function checkSystemdStatus(
+  serviceName: string
+): Promise<{ status: string; unit?: string }> {
+  // Try multiple naming patterns to find the actual systemd unit
+  const patterns = [
+    serviceName, // exact match (e.g., "golf-serie")
+    `sig-${serviceName}`, // sig- prefix (e.g., "sig-gsp")
+    `${serviceName}-server`, // -server suffix (e.g., "golf-improver-server")
+  ];
+
+  for (const pattern of patterns) {
     try {
-      const status = await $`systemctl status ${serviceName}`.text();
-      if (status.includes("failed")) return "failed";
+      const result = await $`systemctl is-active ${pattern}`.text();
+      const status = result.trim();
+      // If we get a definitive answer (not "inactive"), use it
+      if (status !== "inactive") {
+        return { status, unit: pattern };
+      }
+      // If it's inactive, verify it actually exists as a unit
+      try {
+        await $`systemctl status ${pattern}`.quiet();
+        // Unit exists, it's really inactive
+        return { status: "inactive", unit: pattern };
+      } catch {
+        // Unit doesn't exist, try next pattern
+        continue;
+      }
+    } catch {
+      // Try next pattern
+      continue;
+    }
+  }
+
+  // None of the patterns worked, check if it's failed
+  for (const pattern of patterns) {
+    try {
+      const status = await $`systemctl status ${pattern}`.text();
+      if (status.includes("failed")) return { status: "failed", unit: pattern };
     } catch {
       // ignore
     }
-    return "inactive";
   }
+
+  return { status: "inactive" };
 }
 
 async function checkPortOpen(port: number): Promise<boolean> {
@@ -136,7 +166,7 @@ async function getServiceStatus(
   name: string,
   config: ServiceConfig
 ): Promise<ServiceStatus> {
-  const [systemdStatus, portOpen, httpHealth] = await Promise.all([
+  const [systemdResult, portOpen, httpHealth] = await Promise.all([
     checkSystemdStatus(name),
     checkPortOpen(config.port),
     checkHttpHealth(name),
@@ -146,7 +176,8 @@ async function getServiceStatus(
     name,
     port: config.port,
     config: config.live ? "live" : "maintenance",
-    systemd: systemdStatus as ServiceStatus["systemd"],
+    systemd: systemdResult.status as ServiceStatus["systemd"],
+    systemdUnit: systemdResult.unit,
     portOpen,
     httpOk: httpHealth.ok,
     httpStatus: httpHealth.status,
@@ -239,9 +270,10 @@ function printStatusTable(statuses: ServiceStatus[]): void {
           problems.push(
             `http failed${status.httpStatus ? ` (${status.httpStatus})` : ""}`
           );
+        const unitName = status.systemdUnit || status.name;
         console.log(`  - ${status.name}: ${problems.join(", ")}`);
         console.log(`    URL: ${status.url}`);
-        console.log(`    Logs: sudo journalctl -u ${status.name} -n 20`);
+        console.log(`    Logs: sudo journalctl -u ${unitName} -n 20`);
       }
     }
     console.log("");
@@ -255,7 +287,7 @@ function printDetailedStatus(status: ServiceStatus): void {
   console.log(`Port:       ${status.port}`);
   console.log(`Config:     ${status.config === "live" ? "🟢 Live" : "🚧 Maintenance"}`);
   console.log(
-    `Systemd:    ${status.systemd === "active" ? "🟢" : "🔴"} ${status.systemd}`
+    `Systemd:    ${status.systemd === "active" ? "🟢" : "🔴"} ${status.systemd}${status.systemdUnit && status.systemdUnit !== status.name ? ` (${status.systemdUnit})` : ""}`
   );
   console.log(
     `Port Open:  ${status.portOpen ? "🟢 Yes" : "🔴 No"} (nc -z localhost ${status.port})`
@@ -265,17 +297,18 @@ function printDetailedStatus(status: ServiceStatus): void {
   );
   console.log("");
 
-  // Suggest commands
+  // Suggest commands (use actual systemd unit name if different)
+  const unitName = status.systemdUnit || status.name;
   if (status.systemd !== "active") {
     console.log("Commands:");
-    console.log(`  sudo systemctl status ${status.name}`);
-    console.log(`  sudo journalctl -u ${status.name} -n 50`);
-    console.log(`  sudo systemctl restart ${status.name}`);
+    console.log(`  sudo systemctl status ${unitName}`);
+    console.log(`  sudo journalctl -u ${unitName} -n 50`);
+    console.log(`  sudo systemctl restart ${unitName}`);
   } else if (!status.httpOk) {
     console.log("Debug:");
     console.log(`  curl -v ${status.url}`);
     console.log(`  curl -v http://localhost:${status.port}/`);
-    console.log(`  sudo journalctl -u ${status.name} -n 20`);
+    console.log(`  sudo journalctl -u ${unitName} -n 20`);
   }
   console.log("");
 }

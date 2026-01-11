@@ -86,6 +86,11 @@ For each service, the system checks:
 2. **Systemd Status** (`systemctl is-active`)
    - active, inactive, failed, or unknown
    - Indicates if the service process is running
+   - **Smart detection**: Tries multiple naming patterns:
+     - Exact match (e.g., `golf-serie`)
+     - `sig-` prefix (e.g., `sig-gsp` for service `gsp`)
+     - `-server` suffix (e.g., `golf-improver-server` for service `golf-improver`)
+   - Shows detected unit name in detailed view if different from service name
 
 3. **Port Availability** (`nc -z localhost {port}`)
    - Checks if something is listening on the configured port
