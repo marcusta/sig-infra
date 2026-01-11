@@ -100,6 +100,7 @@ For each service, the system checks:
    - Tests full request path through Caddy
    - Verifies service is responding to actual requests
    - Reports HTTP status code
+   - Optional: Specify `healthCheckPath` in services.json to check a specific endpoint (e.g., "/health" or "/status")
 
 ### Status Display
 
@@ -338,6 +339,20 @@ caddy_view                  # View generated Caddyfile
 caddy_regen --dry-run       # Preview regeneration
 ```
 
+**Advanced Service Configuration:**
+To customize HTTP health checks, edit `server/services.json` directly:
+```json
+{
+  "my-service": {
+    "port": 3007,
+    "stripPath": false,
+    "description": "My Service Description",
+    "healthCheckPath": "/health"
+  }
+}
+```
+Then commit and push changes (GitOps workflow).
+
 **Deployment:**
 ```bash
 deploy                      # Full deploy from current directory
@@ -443,9 +458,10 @@ Each service runs as:
 **services.json** (structure - tracked in git):
 ```typescript
 interface ServiceStructure {
-  port: number;          // Port service listens on
-  stripPath?: boolean;   // default true (use handle_path), false = handle
-  description?: string;  // Optional description for systemd
+  port: number;            // Port service listens on
+  stripPath?: boolean;     // default true (use handle_path), false = handle
+  description?: string;    // Optional description for systemd
+  healthCheckPath?: string;// Optional path for HTTP health checks (e.g., "/health")
 }
 ```
 
