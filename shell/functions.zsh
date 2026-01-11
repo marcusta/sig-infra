@@ -377,7 +377,7 @@ _deploy_db_rollback() {
   local db_path=$2
 
   echo "⏪ Rolling back database..."
-  ssh $SIG_SERVER "cd /srv/$service_name && \
+  ssh -t $SIG_SERVER "cd /srv/$service_name && \
     if [ -f $db_path.backup.1 ]; then \
       sudo -u $service_name cp $db_path.backup.1 $db_path; \
       echo '✅ Database rolled back to backup.1'; \
