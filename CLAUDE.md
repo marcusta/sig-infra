@@ -181,7 +181,7 @@ Each service can include a `deploy.json` at the repository root:
     "migrate": "bun run db:migrate",    // Migration command (runs locally)
     "validate": "bun run db:health"     // Validation command (runs locally)
   },
-  "install": "bun install",             // Optional: Install dependencies on server after git pull
+  "install": "bun install",             // Optional: Auto-detected from lockfile, or manually override
   "healthCheck": "curl -f http://localhost:3000/health"  // Optional custom health check
 }
 ```
@@ -189,7 +189,9 @@ Each service can include a `deploy.json` at the repository root:
 **Key principles:**
 - Migration/validation commands run in **project root** working directory on **local machine**
 - Database path provided via **DB_PATH environment variable**: `DB_PATH=deploy-tmp/db.sqlite`
-- Install command runs on **server** after git pull (use `npm install`, `bun install`, `yarn`, etc.)
+- Install command runs on **server** after git pull
+  - **Auto-detected** from lockfile if not specified (bun.lockb → bun install, package-lock.json → npm install, etc.)
+  - Can be manually overridden in deploy.json (e.g., `"install": "pnpm install --frozen-lockfile"`)
 - Commands are project-specific (each service defines its own)
 - Health check is optional (falls back to TCP port check if not specified)
 

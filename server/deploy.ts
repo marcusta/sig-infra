@@ -171,7 +171,25 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
   } catch {
     // No deploy.json or invalid JSON - that's fine
   }
-  
+
+  // Auto-detect package manager if not explicitly set
+  if (!installCmd) {
+    if (await Bun.file(`${servicePath}/bun.lockb`).exists()) {
+      installCmd = "bun install";
+      console.log("📦 Auto-detected: bun (bun.lockb found)");
+    } else if (await Bun.file(`${servicePath}/pnpm-lock.yaml`).exists()) {
+      installCmd = "pnpm install";
+      console.log("📦 Auto-detected: pnpm (pnpm-lock.yaml found)");
+    } else if (await Bun.file(`${servicePath}/yarn.lock`).exists()) {
+      installCmd = "yarn install";
+      console.log("📦 Auto-detected: yarn (yarn.lock found)");
+    } else if (await Bun.file(`${servicePath}/package-lock.json`).exists()) {
+      installCmd = "npm install";
+      console.log("📦 Auto-detected: npm (package-lock.json found)");
+    }
+    // If no lockfile found, installCmd remains undefined (no install step)
+  }
+
   // Check service directory exists
   const dirExists = await Bun.file(servicePath).exists().catch(() => false);
   if (!dirExists) {

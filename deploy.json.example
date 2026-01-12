@@ -7,3 +7,9 @@
   "install": "bun install",
   "healthCheck": "curl -f http://localhost:3000/health"
 }
+
+// Notes:
+// - "install" is optional - auto-detected from lockfile (bun.lockb, package-lock.json, etc.)
+// - Specify "install" only to override auto-detection (e.g., "pnpm install --frozen-lockfile")
+// - "healthCheck" is optional - defaults to TCP port check
+// - "database" section is optional - only needed for DB migrations
