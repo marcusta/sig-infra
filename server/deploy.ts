@@ -213,7 +213,8 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
     // Step 3: Install dependencies (if configured)
     if (installCmd) {
       console.log(`📦 Installing dependencies: ${installCmd}`);
-      await $`cd ${servicePath} && sudo -u ${serviceName} ${installCmd}`;
+      // Use bash -c to ensure proper PATH and environment
+      await $`cd ${servicePath} && sudo -u ${serviceName} bash -c '${installCmd}'`;
     }
 
     // Step 4: Restart service
