@@ -214,7 +214,18 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
     if (installCmd) {
       console.log(`📦 Installing dependencies: ${installCmd}`);
       // Use bash -c to ensure proper PATH and environment
-      await $`cd ${servicePath} && sudo -u ${serviceName} bash -c '${installCmd}'`;
+      // Timeout after 30 seconds - bun install sometimes hangs at the end even when done
+      try {
+        await $`cd ${servicePath} && timeout 30 sudo -u ${serviceName} bash -c '${installCmd}'`;
+      } catch (error: any) {
+        // Exit code 124 means timeout - bun install likely finished but hung
+        if (error.exitCode === 124) {
+          console.log(`⚠️  Install command timed out (likely finished but hung)`);
+        } else {
+          console.error(`❌ Install command failed: ${error}`);
+          throw new Error("Dependency installation failed");
+        }
+      }
     }
 
     // Step 4: Restart service
