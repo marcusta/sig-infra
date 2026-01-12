@@ -4,5 +4,6 @@
     "migrate": "bun run db:migrate",
     "validate": "bun run db:health"
   },
+  "install": "bun install",
   "healthCheck": "curl -f http://localhost:3000/health"
 }

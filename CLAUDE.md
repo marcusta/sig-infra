@@ -181,13 +181,15 @@ Each service can include a `deploy.json` at the repository root:
     "migrate": "bun run db:migrate",    // Migration command (runs locally)
     "validate": "bun run db:health"     // Validation command (runs locally)
   },
+  "install": "bun install",             // Optional: Install dependencies on server after git pull
   "healthCheck": "curl -f http://localhost:3000/health"  // Optional custom health check
 }
 ```
 
 **Key principles:**
-- Migration/validation commands run in **project root** working directory
+- Migration/validation commands run in **project root** working directory on **local machine**
 - Database path provided via **DB_PATH environment variable**: `DB_PATH=deploy-tmp/db.sqlite`
+- Install command runs on **server** after git pull (use `npm install`, `bun install`, `yarn`, etc.)
 - Commands are project-specific (each service defines its own)
 - Health check is optional (falls back to TCP port check if not specified)
 
@@ -207,12 +209,13 @@ Local                           Server
 4. Git commit + push  ────────→
                                 5. Maintenance mode ON
                                 6. Git pull (as service user)
-                                7. Systemctl restart
-                                8. Health check (TCP or custom)
-                                9. Maintenance mode OFF
+                                7. Install dependencies (if configured)
+                                8. Systemctl restart
+                                9. Health check (TCP or custom)
+                                10. Maintenance mode OFF
                                 ←────────────────── Success/Fail
-                                10. If fail: rollback DB + code
-11. Tail logs via journalctl
+                                11. If fail: rollback DB + code
+12. Tail logs via journalctl
 ```
 
 ### Database Backup Strategy

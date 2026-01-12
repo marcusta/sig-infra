@@ -158,6 +158,19 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
   }
 
   const port = services[serviceName].port;
+
+  // Load deploy.json if it exists
+  let installCmd: string | undefined;
+  const deployConfigPath = `${servicePath}/deploy.json`;
+  try {
+    const deployConfig = await Bun.file(deployConfigPath).json();
+    installCmd = deployConfig.install;
+    if (!healthCheckCmd && deployConfig.healthCheck) {
+      healthCheckCmd = deployConfig.healthCheck;
+    }
+  } catch {
+    // No deploy.json or invalid JSON - that's fine
+  }
   
   // Check service directory exists
   const dirExists = await Bun.file(servicePath).exists().catch(() => false);
@@ -178,22 +191,28 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
     // Step 2: Git pull
     console.log(`📥 Pulling latest changes...`);
     await $`cd ${servicePath} && sudo -u ${serviceName} git pull`;
-    
-    // Step 3: Restart service
+
+    // Step 3: Install dependencies (if configured)
+    if (installCmd) {
+      console.log(`📦 Installing dependencies: ${installCmd}`);
+      await $`cd ${servicePath} && sudo -u ${serviceName} ${installCmd}`;
+    }
+
+    // Step 4: Restart service
     console.log(`🔄 Restarting service...`);
     await $`sudo systemctl restart ${serviceName}`;
-    
-    // Step 4: Health check
+
+    // Step 5: Health check
     const healthy = await waitForHealthy(serviceName, port, healthCheckCmd);
     if (!healthy) {
       throw new Error(`Service failed to become healthy on port ${port}`);
     }
     console.log(`✅ Service is healthy`);
-    
-    // Step 5: Maintenance mode OFF
+
+    // Step 6: Maintenance mode OFF
     console.log(`🟢 Disabling maintenance mode...`);
     await setMaintenance(serviceName, false);
-    
+
     console.log(`\n✅ Deployment successful!\n`);
     
   } catch (error) {
