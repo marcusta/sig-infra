@@ -144,8 +144,9 @@ async function waitForHealthy(
 // Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function deploy(serviceName: string, healthCheckCmd?: string): Promise<void> {
-  const servicePath = `/srv/${serviceName}`;
+async function deploy(serviceName: string, healthCheckCmd?: string, serverFolder?: string): Promise<void> {
+  const folder = serverFolder || serviceName;
+  const servicePath = `/srv/${folder}`;
 
   // Validate
   console.log(`\n🚀 Deploying ${serviceName}...\n`);
@@ -208,7 +209,7 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
   try {
     // Step 2: Git pull
     console.log(`📥 Pulling latest changes...`);
-    await $`cd ${servicePath} && sudo -u ${serviceName} git pull`;
+    await $`cd ${servicePath} && sudo -u ${folder} git pull`;
 
     // Step 3: Install dependencies (if configured)
     if (installCmd) {
@@ -216,7 +217,7 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
       // Use bash -c to ensure proper PATH and environment
       // Timeout after 30 seconds - bun install sometimes hangs at the end even when done
       try {
-        await $`cd ${servicePath} && timeout 30 sudo -u ${serviceName} bash -c '${installCmd}'`;
+        await $`cd ${servicePath} && timeout 30 sudo -u ${folder} bash -c '${installCmd}'`;
       } catch (error: any) {
         // Exit code 124 means timeout - bun install likely finished but hung
         if (error.exitCode === 124) {
@@ -230,10 +231,10 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
 
     // Step 4: Restart service
     console.log(`🔄 Restarting service...`);
-    await $`sudo systemctl restart ${serviceName}`;
+    await $`sudo systemctl restart ${folder}`;
 
     // Step 5: Health check
-    const healthy = await waitForHealthy(serviceName, port, healthCheckCmd);
+    const healthy = await waitForHealthy(folder, port, healthCheckCmd);
     if (!healthy) {
       throw new Error(`Service failed to become healthy on port ${port}`);
     }
@@ -255,7 +256,7 @@ async function deploy(serviceName: string, healthCheckCmd?: string): Promise<voi
   }
 }
 
-async function status(serviceName: string): Promise<void> {
+async function status(serviceName: string, serverFolder?: string): Promise<void> {
   const services = await loadServices();
   
   if (!services[serviceName]) {
@@ -283,8 +284,9 @@ async function status(serviceName: string): Promise<void> {
   console.log(``);
 }
 
-async function rollback(serviceName: string): Promise<void> {
-  const servicePath = `/srv/${serviceName}`;
+async function rollback(serviceName: string, serverFolder?: string): Promise<void> {
+  const folder = serverFolder || serviceName;
+  const servicePath = `/srv/${folder}`;
   
   console.log(`\n⏪ Rolling back ${serviceName}...\n`);
   
@@ -306,16 +308,16 @@ async function rollback(serviceName: string): Promise<void> {
   try {
     // Reset to previous commit
     console.log(`📥 Reverting to previous commit...`);
-    await $`cd ${servicePath} && sudo -u ${serviceName} git reset --hard HEAD~1`;
-    
+    await $`cd ${servicePath} && sudo -u ${folder} git reset --hard HEAD~1`;
+
     // Restart
     console.log(`🔄 Restarting service...`);
-    await $`sudo systemctl restart ${serviceName}`;
-    
+    await $`sudo systemctl restart ${folder}`;
+
     // Health check (note: rollback doesn't support custom health check)
     const services = await loadServices();
     const port = services[serviceName].port;
-    const healthy = await waitForHealthy(serviceName, port);
+    const healthy = await waitForHealthy(folder, port);
 
     if (!healthy) {
       throw new Error(`Service failed to become healthy after rollback`);
@@ -341,12 +343,18 @@ async function rollback(serviceName: string): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const serviceName = args.find(a => !a.startsWith("--"));
-  const command = args.find(a => a.startsWith("--") && !a.includes("--health-check"));
+  const command = args.find(a => a.startsWith("--") && !a.includes("--health-check") && !a.includes("--folder"));
 
   // Extract health check command if provided
   const healthCheckIndex = args.indexOf("--health-check");
   const healthCheckCmd = healthCheckIndex >= 0 && args[healthCheckIndex + 1]
     ? args[healthCheckIndex + 1]
+    : undefined;
+
+  // Extract folder override if provided (when server folder differs from service name)
+  const folderIndex = args.indexOf("--folder");
+  const serverFolder = folderIndex >= 0 && args[folderIndex + 1]
+    ? args[folderIndex + 1]
     : undefined;
 
   if (!serviceName) {
@@ -356,13 +364,13 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "--status":
-      await status(serviceName);
+      await status(serviceName, serverFolder);
       break;
     case "--rollback":
-      await rollback(serviceName);
+      await rollback(serviceName, serverFolder);
       break;
     default:
-      await deploy(serviceName, healthCheckCmd);
+      await deploy(serviceName, healthCheckCmd, serverFolder);
   }
 }
 

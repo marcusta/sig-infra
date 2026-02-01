@@ -346,24 +346,25 @@ app_maint() {
 _deploy_db_backup_and_upload() {
   local service_name=$1
   local db_path=$2
+  local server_folder=${3:-$service_name}
 
   echo "💾 Backing up database on server..."
   # Use single quotes for bash -c to avoid quoting issues, expand variables before sending
-  ssh -t $SIG_SERVER "sudo -u $service_name bash -c 'cd /srv/$service_name && if [ -f $db_path.backup.1 ]; then mv $db_path.backup.1 $db_path.backup.2; fi && if [ -f $db_path ]; then cp $db_path $db_path.backup.1; fi'" || {
+  ssh -t $SIG_SERVER "sudo -u $server_folder bash -c 'cd /srv/$server_folder && if [ -f $db_path.backup.1 ]; then mv $db_path.backup.1 $db_path.backup.2; fi && if [ -f $db_path ]; then cp $db_path $db_path.backup.1; fi'" || {
     echo "❌ Failed to backup database"
     return 1
   }
 
-  echo "📤 Uploading migrated database..."
+  echo "📤 Uploading deploy-tmp/db.sqlite → /srv/$server_folder/$db_path"
   # Upload to tmp first (marcus can write there), then move with sudo
   scp "deploy-tmp/db.sqlite" "$SIG_SERVER:/tmp/$service_name-db.new" || {
     echo "❌ Failed to upload database"
     return 1
   }
 
-  ssh -t $SIG_SERVER "sudo mv /tmp/$service_name-db.new /srv/$service_name/$db_path.new && \
-    sudo chown $service_name:$service_name /srv/$service_name/$db_path.new && \
-    sudo -u $service_name mv /srv/$service_name/$db_path.new /srv/$service_name/$db_path" || {
+  ssh -t $SIG_SERVER "sudo mv /tmp/$service_name-db.new /srv/$server_folder/$db_path.new && \
+    sudo chown $server_folder:$server_folder /srv/$server_folder/$db_path.new && \
+    sudo -u $server_folder mv /srv/$server_folder/$db_path.new /srv/$server_folder/$db_path" || {
     echo "❌ Failed to move database into place"
     return 1
   }
@@ -375,19 +376,246 @@ _deploy_db_backup_and_upload() {
 _deploy_db_rollback() {
   local service_name=$1
   local db_path=$2
+  local server_folder=${3:-$service_name}
 
   echo "⏪ Rolling back database..."
-  ssh -t $SIG_SERVER "cd /srv/$service_name && \
+  ssh -t $SIG_SERVER "cd /srv/$server_folder && \
     if [ -f $db_path.backup.1 ]; then \
-      sudo -u $service_name cp $db_path.backup.1 $db_path; \
+      sudo -u $server_folder cp $db_path.backup.1 $db_path; \
       echo '✅ Database rolled back to backup.1'; \
     else \
       echo '⚠️  No backup found to restore'; \
     fi"
 }
 
+deploy_preflight() {
+  local service_name=$(basename "$PWD")
+  local server_folder="$service_name"
+  local errors=0
+  local warnings=0
+
+  # Override service name and server folder from deploy.json if present
+  # serviceName overrides only the services.json key / systemd unit
+  # serverFolder overrides only the /srv/ directory (defaults to local folder name)
+  if [[ -f "deploy.json" ]]; then
+    local name_override=$(jq -r '.serviceName // empty' deploy.json 2>/dev/null)
+    if [[ -n "$name_override" ]]; then
+      service_name="$name_override"
+    fi
+    local folder_override=$(jq -r '.serverFolder // empty' deploy.json 2>/dev/null)
+    if [[ -n "$folder_override" ]]; then
+      server_folder="$folder_override"
+    fi
+  fi
+
+  echo "🔍 Preflight check: $service_name (folder: $server_folder)"
+  echo "────────────────────────────────────────"
+
+  # 1. deploy.json exists and is valid JSON
+  if [[ ! -f "deploy.json" ]]; then
+    echo "❌ deploy.json not found"
+    ((errors++))
+    echo "────────────────────────────────────────"
+    echo "❌ $errors error(s) — fix before deploying"
+    return 1
+  fi
+
+  if ! jq empty deploy.json 2>/dev/null; then
+    echo "❌ deploy.json is not valid JSON"
+    ((errors++))
+    echo "────────────────────────────────────────"
+    echo "❌ $errors error(s) — fix before deploying"
+    return 1
+  fi
+  echo "✅ deploy.json valid"
+
+  # 2. Database section checks (if present)
+  local db_path=$(jq -r '.database.path // empty' deploy.json)
+  if [[ -n "$db_path" ]]; then
+    echo "✅ database.path: $db_path"
+
+    local db_migrate=$(jq -r '.database.migrate // empty' deploy.json)
+    local db_validate=$(jq -r '.database.validate // empty' deploy.json)
+
+    if [[ -z "$db_migrate" ]]; then
+      echo "❌ database.migrate not defined"
+      ((errors++))
+    fi
+    if [[ -z "$db_validate" ]]; then
+      echo "❌ database.validate not defined"
+      ((errors++))
+    fi
+
+    # 3. Migration/validation scripts exist locally
+    # Skip file check for "bun run X" / "npm run X" style commands (validated via package.json in check 4)
+    if [[ -n "$db_migrate" ]]; then
+      if echo "$db_migrate" | grep -qE '^(bun|npm|npx|pnpm|yarn) run '; then
+        echo "✅ migrate command: $db_migrate (package.json script)"
+      else
+        local migrate_script=$(echo "$db_migrate" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+        migrate_script=${migrate_script#./}
+        if [[ -f "$migrate_script" ]]; then
+          echo "✅ $migrate_script exists"
+        else
+          echo "❌ $migrate_script not found"
+          ((errors++))
+        fi
+      fi
+    fi
+
+    if [[ -n "$db_validate" ]]; then
+      if echo "$db_validate" | grep -qE '^(bun|npm|npx|pnpm|yarn) run '; then
+        echo "✅ validate command: $db_validate (package.json script)"
+      else
+        local validate_script=$(echo "$db_validate" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+        validate_script=${validate_script#./}
+        if [[ -f "$validate_script" ]]; then
+          echo "✅ $validate_script exists"
+        else
+          echo "❌ $validate_script not found"
+          ((errors++))
+        fi
+      fi
+    fi
+
+    # 3b. Verify scripts reference DB_PATH env var
+    # Resolve actual script files to check for DB_PATH usage
+    local migrate_file=""
+    local validate_file=""
+
+    if [[ -n "$db_migrate" ]]; then
+      if echo "$db_migrate" | grep -qE '^(bun|npm|npx|pnpm|yarn) run '; then
+        # Resolve from package.json: "bun run db:migrate" → look up scripts.db:migrate
+        local script_name=$(echo "$db_migrate" | sed -E 's/^[^ ]+ run //')
+        local resolved=$(jq -r ".scripts[\"$script_name\"] // empty" package.json 2>/dev/null)
+        if [[ -n "$resolved" ]]; then
+          migrate_file=$(echo "$resolved" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+          migrate_file=${migrate_file#./}
+        fi
+      else
+        migrate_file=$(echo "$db_migrate" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+        migrate_file=${migrate_file#./}
+      fi
+    fi
+
+    if [[ -n "$db_validate" ]]; then
+      if echo "$db_validate" | grep -qE '^(bun|npm|npx|pnpm|yarn) run '; then
+        local script_name=$(echo "$db_validate" | sed -E 's/^[^ ]+ run //')
+        local resolved=$(jq -r ".scripts[\"$script_name\"] // empty" package.json 2>/dev/null)
+        if [[ -n "$resolved" ]]; then
+          validate_file=$(echo "$resolved" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+          validate_file=${validate_file#./}
+        fi
+      else
+        validate_file=$(echo "$db_validate" | sed -E 's/^[^ ]+ +//' | sed 's/ .*//')
+        validate_file=${validate_file#./}
+      fi
+    fi
+
+    if [[ -n "$migrate_file" && -f "$migrate_file" ]]; then
+      if grep -q "DB_PATH" "$migrate_file"; then
+        echo "✅ $migrate_file reads DB_PATH env var"
+      else
+        echo "❌ $migrate_file does not reference DB_PATH — migration will use wrong database"
+        ((errors++))
+      fi
+    fi
+
+    if [[ -n "$validate_file" && -f "$validate_file" ]]; then
+      if grep -q "DB_PATH" "$validate_file"; then
+        echo "✅ $validate_file reads DB_PATH env var"
+      else
+        echo "❌ $validate_file does not reference DB_PATH — validation will use wrong database"
+        ((errors++))
+      fi
+    fi
+
+    # 4. package.json scripts defined
+    if [[ -f "package.json" ]]; then
+      if jq -e '.scripts["db:migrate"]' package.json >/dev/null 2>&1; then
+        echo "✅ package.json has db:migrate script"
+      else
+        echo "❌ package.json missing db:migrate script"
+        ((errors++))
+      fi
+      if jq -e '.scripts["db:health"]' package.json >/dev/null 2>&1; then
+        echo "✅ package.json has db:health script"
+      else
+        echo "❌ package.json missing db:health script"
+        ((errors++))
+      fi
+    else
+      echo "❌ package.json not found"
+      ((errors++))
+    fi
+
+    # 5. Remote database file exists
+    if ssh $SIG_SERVER "test -f /srv/$server_folder/$db_path" 2>/dev/null; then
+      echo "✅ Remote DB exists: /srv/$server_folder/$db_path"
+    else
+      echo "❌ Remote DB not found at /srv/$server_folder/$db_path"
+      ((errors++))
+    fi
+  fi
+
+  # 6. Remote service directory exists
+  if ssh $SIG_SERVER "test -d /srv/$server_folder" 2>/dev/null; then
+    echo "✅ Remote service directory exists"
+  else
+    echo "❌ Remote service directory /srv/$server_folder not found"
+    ((errors++))
+  fi
+
+  # 7. Remote systemd unit exists
+  local systemd_status=$(ssh $SIG_SERVER "systemctl is-active $service_name 2>/dev/null" 2>/dev/null)
+  if [[ -n "$systemd_status" && "$systemd_status" != "unknown" ]]; then
+    echo "✅ Systemd unit: $systemd_status"
+  else
+    echo "❌ Systemd unit not found for $service_name"
+    ((errors++))
+  fi
+
+  # 8. Service exists in services.json
+  if ssh $SIG_SERVER "jq -e '.[\"$service_name\"]' $SIG_INFRA_REMOTE/server/services.json" >/dev/null 2>&1; then
+    echo "✅ Service registered in services.json"
+  else
+    echo "❌ Service not found in services.json"
+    ((errors++))
+  fi
+
+  # 9. .gitignore includes deploy-tmp/
+  if [[ -f ".gitignore" ]] && grep -q "deploy-tmp" .gitignore 2>/dev/null; then
+    echo "✅ .gitignore includes deploy-tmp/"
+  else
+    echo "⚠️  .gitignore missing deploy-tmp/"
+    ((warnings++))
+  fi
+
+  # 10. healthCheck syntax (if present)
+  local health_check=$(jq -r '.healthCheck // empty' deploy.json)
+  if [[ -n "$health_check" ]]; then
+    if echo "$health_check" | grep -qE '^curl\s'; then
+      echo "✅ healthCheck: $health_check"
+    else
+      echo "⚠️  healthCheck doesn't start with curl — may not work as expected"
+      ((warnings++))
+    fi
+  fi
+
+  echo "────────────────────────────────────────"
+  if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
+    echo "✅ All checks passed — ready to deploy"
+  elif [[ $errors -eq 0 ]]; then
+    echo "✅ All checks passed ($warnings warning(s)) — ready to deploy"
+  else
+    echo "❌ $errors error(s), $warnings warning(s) — fix before deploying"
+    return 1
+  fi
+}
+
 deploy() {
   local service_name=$(basename "$PWD")
+  local server_folder="$service_name"
   local build_config=".build"
   local has_database=false
   local db_path=""
@@ -395,7 +623,21 @@ deploy() {
   local db_validate_cmd=""
   local health_check_cmd=""
 
-  echo "🚀 Deploying $service_name..."
+  # Override service name and server folder from deploy.json if present
+  # serviceName overrides only the services.json key / systemd unit
+  # serverFolder overrides only the /srv/ directory (defaults to local folder name)
+  if [[ -f "deploy.json" ]]; then
+    local name_override=$(jq -r '.serviceName // empty' deploy.json 2>/dev/null)
+    if [[ -n "$name_override" ]]; then
+      service_name="$name_override"
+    fi
+    local folder_override=$(jq -r '.serverFolder // empty' deploy.json 2>/dev/null)
+    if [[ -n "$folder_override" ]]; then
+      server_folder="$folder_override"
+    fi
+  fi
+
+  echo "🚀 Deploying $service_name (folder: $server_folder)..."
   echo ""
 
   # Check for deploy.json
@@ -421,25 +663,27 @@ deploy() {
     ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
 
     # 2. Download DB
-    echo "📥 Downloading production database..."
+    echo "📥 Downloading /srv/$server_folder/$db_path → deploy-tmp/db.sqlite"
     mkdir -p deploy-tmp
-    scp "$SIG_SERVER:/srv/$service_name/$db_path" "deploy-tmp/db.sqlite" || {
+    scp "$SIG_SERVER:/srv/$server_folder/$db_path" "deploy-tmp/db.sqlite" || {
       echo "❌ Failed to download database. Aborting."
       ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
       return 1
     }
 
     # 3. Run migration
-    echo "🔄 Running migration: $db_migrate_cmd"
-    DB_PATH="deploy-tmp/db.sqlite" eval "$db_migrate_cmd" || {
+    echo "🔄 Running migration on deploy-tmp/db.sqlite"
+    echo "   DB_PATH=deploy-tmp/db.sqlite $db_migrate_cmd"
+    ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$db_migrate_cmd" ) || {
       echo "❌ Migration failed. Aborting."
       ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
       return 1
     }
 
     # 4. Run validation
-    echo "🔍 Running validation: $db_validate_cmd"
-    DB_PATH="deploy-tmp/db.sqlite" eval "$db_validate_cmd" || {
+    echo "🔍 Running validation on deploy-tmp/db.sqlite"
+    echo "   DB_PATH=deploy-tmp/db.sqlite $db_validate_cmd"
+    ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$db_validate_cmd" ) || {
       echo "❌ Validation failed. Aborting."
       ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
       return 1
@@ -476,7 +720,7 @@ deploy() {
 
   # Step 3: Upload database if migrated
   if [[ "$has_database" == "true" ]]; then
-    _deploy_db_backup_and_upload "$service_name" "$db_path" || {
+    _deploy_db_backup_and_upload "$service_name" "$db_path" "$server_folder" || {
       echo "❌ Database upload failed. Aborting."
       ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
       return 1
@@ -489,6 +733,9 @@ deploy() {
   echo "────────────────────────────────────────"
 
   local deploy_cmd="bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name"
+  if [[ "$server_folder" != "$service_name" ]]; then
+    deploy_cmd="$deploy_cmd --folder $server_folder"
+  fi
   if [[ -n "$health_check_cmd" ]]; then
     deploy_cmd="$deploy_cmd --health-check '$health_check_cmd'"
   fi
@@ -500,7 +747,7 @@ deploy() {
     # Rollback database if it was involved
     if [[ "$has_database" == "true" ]]; then
       echo ""
-      _deploy_db_rollback "$service_name" "$db_path"
+      _deploy_db_rollback "$service_name" "$db_path" "$server_folder"
     fi
 
     echo ""
@@ -517,7 +764,7 @@ deploy() {
   # Step 5: Tail logs
   echo "📋 Tailing logs (Ctrl+C to exit)..."
   echo "────────────────────────────────────────"
-  ssh -t $SIG_SERVER "sudo journalctl -u $service_name -f -n 20"
+  ssh -t $SIG_SERVER "sudo journalctl -u $server_folder -f -n 20"
 }
 
 deploy_status() {
@@ -541,11 +788,24 @@ deploy_rollback() {
 
 db_pull() {
   local service_name=${1:-$(basename "$PWD")}
+  local server_folder="$service_name"
 
   # Check for deploy.json
   if [[ ! -f "deploy.json" ]]; then
     echo "❌ No deploy.json found in current directory"
     return 1
+  fi
+
+  # Override service name and server folder from deploy.json if present
+  # serviceName overrides only the services.json key / systemd unit
+  # serverFolder overrides only the /srv/ directory (defaults to local folder name)
+  local name_override=$(jq -r '.serviceName // empty' deploy.json 2>/dev/null)
+  if [[ -n "$name_override" ]]; then
+    service_name="$name_override"
+  fi
+  local folder_override=$(jq -r '.serverFolder // empty' deploy.json 2>/dev/null)
+  if [[ -n "$folder_override" ]]; then
+    server_folder="$folder_override"
   fi
 
   # Parse database path
@@ -558,7 +818,7 @@ db_pull() {
   echo "📥 Downloading production database for $service_name..."
   mkdir -p deploy-tmp
 
-  scp "$SIG_SERVER:/srv/$service_name/$db_path" "deploy-tmp/db.sqlite" || {
+  scp "$SIG_SERVER:/srv/$server_folder/$db_path" "deploy-tmp/db.sqlite" || {
     echo "❌ Failed to download database"
     return 1
   }
@@ -591,7 +851,7 @@ db_migrate_test() {
   echo "   DB_PATH=deploy-tmp/db.sqlite"
   echo ""
 
-  DB_PATH="deploy-tmp/db.sqlite" eval "$migrate_cmd" || {
+  ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$migrate_cmd" ) || {
     echo "❌ Migration failed"
     return 1
   }
@@ -620,7 +880,7 @@ db_validate_test() {
   echo "   DB_PATH=deploy-tmp/db.sqlite"
   echo ""
 
-  DB_PATH="deploy-tmp/db.sqlite" eval "$validate_cmd" || {
+  ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$validate_cmd" ) || {
     echo "❌ Validation failed"
     return 1
   }
