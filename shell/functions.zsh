@@ -892,20 +892,15 @@ db_validate_test() {
 # Help
 # =============================================================================
 
-unalias helpme 2>/dev/null
-helpme() {
-  echo "--- DEV ENVIRONMENT ---"
-  echo "colima_start   : Start Colima (2CPU/8GB)"
-  echo "redis_start    : Start Redis Docker container"
-  echo "pnx            : Run pnpm nx"
-  echo "devlist        : Manage running Node/Vite/Bun dev servers"
+helpme_sig_infra() {
   echo ""
   echo "--- DEPLOYMENT ---"
   echo "deploy         : Deploy current folder to server"
   echo "deploy_status  : Check service status (deploy_status [service])"
   echo "deploy_rollback: Rollback to previous commit"
+  echo "deploy_preflight: Pre-deploy checks"
   echo ""
-  echo "--- DATABASE DEVELOPMENT ---"
+  echo "--- DATABASE ---"
   echo "db_pull        : Download production database for local testing"
   echo "db_migrate_test: Run migration on downloaded database"
   echo "db_validate_test: Run validation on migrated database"
@@ -913,23 +908,19 @@ helpme() {
   echo "--- SERVICE SETUP ---"
   echo "service_create : Interactive wizard to create new service"
   echo ""
-  echo "--- CADDY MANAGEMENT ---"
-  echo "caddy_list     : List all services with comprehensive status"
-  echo "caddy_status   : Check specific service status (caddy_status <service>)"
-  echo "caddy_add      : Add a new service (caddy_add <name> <port>)"
+  echo "--- CADDY ---"
+  echo "caddy_list     : List all services with status"
+  echo "caddy_status   : Check specific service (caddy_status <service>)"
+  echo "caddy_add      : Add a service (caddy_add <name> <port>)"
   echo "caddy_remove   : Remove a service from Caddy"
   echo "caddy_view     : View the generated Caddyfile"
   echo "caddy_regen    : Regenerate Caddyfile (--dry-run to preview)"
   echo "app_maint      : Toggle maintenance mode"
   echo ""
   echo "--- INFRASTRUCTURE ---"
-  echo "infra_push        : Push infra changes to server"
-  echo "infra_pull        : Pull latest infra locally"
-  echo "infra_pull_remote : Pull latest infra on server"
-  echo "infra_status      : Show local/server infra sync status"
-  echo ""
-  echo "--- REMOTE SERVER ---"
-  echo "rtail [file]   : Tail logs on server"
+  echo "infra_push     : Push infra changes to server"
+  echo "infra_pull     : Pull latest infra locally"
+  echo "infra_status   : Show local/server infra sync status"
 }
 
 # =============================================================================
