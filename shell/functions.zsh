@@ -618,10 +618,17 @@ deploy() {
   local server_folder="$service_name"
   local build_config=".build"
   local has_database=false
+  local skip_db=false
   local db_path=""
   local db_migrate_cmd=""
   local db_validate_cmd=""
   local health_check_cmd=""
+
+  # Parse flags
+  if [[ "$1" == "--no-db" ]]; then
+    skip_db=true
+    shift
+  fi
 
   # Override service name and server folder from deploy.json if present
   # serviceName overrides only the services.json key / systemd unit
@@ -644,10 +651,14 @@ deploy() {
   if [[ -f "deploy.json" ]]; then
     db_path=$(jq -r '.database.path // empty' deploy.json)
     if [[ -n "$db_path" ]]; then
-      has_database=true
-      db_migrate_cmd=$(jq -r '.database.migrate' deploy.json)
-      db_validate_cmd=$(jq -r '.database.validate' deploy.json)
-      echo "📊 Database detected: $db_path"
+      if [[ "$skip_db" == "true" ]]; then
+        echo "📊 Database configured but skipped (--no-db)"
+      else
+        has_database=true
+        db_migrate_cmd=$(jq -r '.database.migrate' deploy.json)
+        db_validate_cmd=$(jq -r '.database.validate' deploy.json)
+        echo "📊 Database detected: $db_path"
+      fi
     fi
     health_check_cmd=$(jq -r '.healthCheck // empty' deploy.json)
   fi
@@ -895,7 +906,7 @@ db_validate_test() {
 helpme_sig_infra() {
   echo ""
   echo "--- DEPLOYMENT ---"
-  echo "deploy         : Deploy current folder to server"
+  echo "deploy         : Deploy current folder to server (--no-db to skip database)"
   echo "deploy_status  : Check service status (deploy_status [service])"
   echo "deploy_rollback: Rollback to previous commit"
   echo "deploy_preflight: Pre-deploy checks"
@@ -992,6 +1003,7 @@ compdef _caddy_remove_completion caddy_remove
 compdef _caddy_status_completion caddy_status
 compdef _caddy_regen_completion caddy_regen
 compdef _infra_push_completion infra_push
+compdef '_arguments "1:option:(--no-db)"' deploy
 compdef '_arguments "1:service:($(_get_caddy_services))"' deploy_status
 compdef '_arguments "1:service:($(_get_caddy_services))"' deploy_rollback
 
