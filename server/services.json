@@ -25,5 +25,8 @@
     "port": 4005,
     "stripPath": false,
     "healthCheckPath": ""
+  },
+  "brain-inbox": {
+    "port": 3101
   }
 }
