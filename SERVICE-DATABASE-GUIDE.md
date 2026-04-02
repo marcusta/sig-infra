@@ -27,6 +27,8 @@ Create `deploy.json` in your service repository root:
 
 ```json
 {
+  "serviceName": "bookings",
+  "serverFolder": "sig-booking",
   "database": {
     "path": "data/db.sqlite",
     "migrate": "bun run db:migrate",
@@ -38,9 +40,21 @@ Create `deploy.json` in your service repository root:
 
 ### Configuration Fields
 
+#### `serviceName` (optional)
+- Overrides the service name used for `services.json` lookup and systemd unit
+- Defaults to the local folder name (e.g., `basename $PWD`)
+- Does **not** affect `serverFolder` — they are independent
+- Only needed when the local folder name doesn't match the services.json key
+
+#### `serverFolder` (optional)
+- Overrides the directory name under `/srv/` on the server
+- Defaults to the local folder name (NOT `serviceName`)
+- Only needed when the server folder differs from the local folder name
+- Example: local folder `sig-booking`, services.json key `bookings` → only need `"serviceName": "bookings"`, no `serverFolder` needed
+
 #### `database.path` (required if using database)
-- Relative path from `/srv/{your-service}/` on the server
-- Example: `"data/db.sqlite"` → `/srv/golf-serie/data/db.sqlite`
+- Relative path from `/srv/{serverFolder}/` on the server
+- Example: `"data/db.sqlite"` → `/srv/sig-booking/data/db.sqlite`
 - This is where your production database lives on the server
 
 #### `database.migrate` (required if using database)
@@ -254,9 +268,28 @@ Works exactly as before:
 4. Health check (TCP port)
 5. Tail logs
 
+## Preflight Validation
+
+Before deploying or testing migrations, validate your setup:
+
+```bash
+cd ~/projects/your-service
+
+deploy_preflight
+```
+
+This verifies:
+- `deploy.json` is valid with required fields
+- Migration/validation scripts exist and reference `DB_PATH` env var
+- `package.json` has the required scripts
+- Remote service, database, and systemd unit exist
+- `.gitignore` includes `deploy-tmp/`
+
+**Run this first** when setting up migration support for a new service. It catches common issues like missing scripts, wrong paths, or scripts that ignore the `DB_PATH` environment variable.
+
 ## Local Development Testing
 
-Before deploying, test your migration locally:
+After preflight passes, test your migration against production data:
 
 ```bash
 cd ~/projects/your-service
@@ -264,7 +297,7 @@ cd ~/projects/your-service
 # Download production database
 db_pull
 
-# Run migration on the downloaded DB
+# Run migration on the downloaded DB (sets DB_PATH=deploy-tmp/db.sqlite)
 db_migrate_test
 
 # Validate migration
@@ -274,9 +307,12 @@ db_validate_test
 sqlite3 deploy-tmp/db.sqlite
 ```
 
+**Important:** Check the migration output path. It should show `deploy-tmp/db.sqlite`, not your fallback path. If it shows the fallback (e.g., `data/db.sqlite`), your script is not reading `DB_PATH` correctly and the deploy will upload an un-migrated database.
+
 This lets you:
 - Test migrations against real production data structure
 - Verify schema changes work correctly
+- Confirm `DB_PATH` is being read correctly
 - Catch issues before deploying
 
 ## Backup and Rollback
@@ -494,7 +530,9 @@ Before deploying a service with database changes:
 - [ ] Created `deploy.json` with correct paths
 - [ ] Migration script reads `DB_PATH` environment variable
 - [ ] Validation script verifies schema changes
+- [ ] `deploy_preflight` passes all checks
 - [ ] Tested locally: `db_pull && db_migrate_test && db_validate_test`
+- [ ] Migration output shows `deploy-tmp/db.sqlite` path (not the fallback)
 - [ ] Migration is idempotent (safe to run multiple times)
 - [ ] Validation is comprehensive (checks actual schema, not just "doesn't crash")
 - [ ] Added `deploy-tmp/` to `.gitignore`

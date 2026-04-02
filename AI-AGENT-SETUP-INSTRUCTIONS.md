@@ -36,6 +36,8 @@ Create `deploy.json` in the repository root:
 **Content:**
 ```json
 {
+  "serviceName": "{{SERVICE_NAME}}",
+  "serverFolder": "{{SERVER_FOLDER}}",
   "database": {
     "path": "{{DB_FILE_PATH}}",
     "migrate": "bun run db:migrate",
@@ -44,7 +46,17 @@ Create `deploy.json` in the repository root:
 }
 ```
 
-**Replace `{{DB_FILE_PATH}}`** with the actual path you found in prerequisites.
+**Replace placeholders:**
+- `{{DB_FILE_PATH}}` → actual database path on server (relative to `/srv/{serverFolder}/`)
+- `{{SERVICE_NAME}}` → the key in `services.json` and systemd unit name. **Omit this field** if it matches the local folder name.
+- `{{SERVER_FOLDER}}` → the directory name under `/srv/` on the server. **Omit this field** if it matches the local folder name. Note: defaults to local folder name, NOT to `serviceName`.
+
+**When to include name overrides:**
+- If local folder is `sig-booking` but services.json key is `bookings` → set `"serviceName": "bookings"` (no `serverFolder` needed, it stays `sig-booking`)
+- If server folder differs from local folder name → set `"serverFolder"` explicitly
+- If everything matches (most common) → omit both fields
+
+**Ask the user** if you're unsure whether the local folder name matches the services.json key or server directory.
 
 **Note:** Do NOT include `healthCheck` field yet - we'll add it later if needed.
 
@@ -52,6 +64,7 @@ Create `deploy.json` in the repository root:
 - File created at repository root
 - JSON is valid (no syntax errors)
 - `path` field matches the actual database location
+- `serviceName`/`serverFolder` match actual server configuration (if included)
 
 ### Step 2: Update package.json
 
@@ -316,29 +329,54 @@ deploy-tmp/
 - `.gitignore` includes `*.local-backup`
 - No duplicate entries
 
-### Step 8: Test the scripts locally
+### Step 8: Run preflight validation
 
-**Before finalizing**, test that the scripts run:
+**Before testing scripts**, run the preflight check to validate the full setup:
 
 ```bash
-# Test migration script
-bun run db:migrate
+deploy_preflight
+```
 
-# Test validation script
-bun run db:health
+This checks:
+- `deploy.json` is valid and has required fields
+- Migration/validation scripts exist locally
+- Scripts reference `DB_PATH` environment variable (critical — without this, migrations run on the wrong database)
+- `package.json` has `db:migrate` and `db:health` scripts
+- Remote database, service directory, and systemd unit exist
+- Service is registered in `services.json`
+- `.gitignore` includes `deploy-tmp/`
+
+**All checks must pass before proceeding.** Fix any errors reported.
+
+### Step 9: Test migration against production data
+
+**After preflight passes**, test the full migration workflow locally:
+
+```bash
+# Download production database to deploy-tmp/db.sqlite
+db_pull
+
+# Run migration on the downloaded DB (sets DB_PATH=deploy-tmp/db.sqlite)
+db_migrate_test
+
+# Validate the migrated DB
+db_validate_test
 ```
 
 **Expected behavior:**
-- Scripts should run without syntax errors
-- Migration should log success (even if no changes)
-- Validation should pass
+- `db_pull` downloads the database successfully
+- `db_migrate_test` runs migration and output shows path `deploy-tmp/db.sqlite` (NOT the fallback path)
+- `db_validate_test` passes validation
+
+**Critical check:** Verify the migration output shows the correct path. If it shows the fallback path (e.g., `data/status.db` instead of `deploy-tmp/db.sqlite`), your script is not reading the `DB_PATH` environment variable correctly. Fix this before deploying.
 
 **If errors occur:**
 - Check TypeScript syntax
 - Verify database path is correct
 - Ensure database library is installed
+- Confirm `process.env.DB_PATH` is used (not ignored or overridden)
 
-### Step 9: Create summary document
+### Step 10: Create summary document
 
 Create a file: `DATABASE-MIGRATION-SETUP.md` in the repository root.
 
@@ -449,7 +487,7 @@ The deployment will:
 - Contains clear next steps
 - References actual file paths
 
-### Step 10: Final validation checklist
+### Step 11: Final validation checklist
 
 Verify all files are in place:
 

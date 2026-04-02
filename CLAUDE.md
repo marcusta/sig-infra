@@ -176,8 +176,10 @@ Each service can include a `deploy.json` at the repository root:
 
 ```json
 {
+  "serviceName": "bookings",            // Optional: override service name (services.json key, systemd unit)
+  "serverFolder": "sig-booking",        // Optional: override server directory under /srv/
   "database": {
-    "path": "data/db.sqlite",           // Path on server (relative to /srv/{service}/)
+    "path": "data/db.sqlite",           // Path on server (relative to /srv/{serverFolder}/)
     "migrate": "bun run db:migrate",    // Migration command (runs locally)
     "validate": "bun run db:health"     // Validation command (runs locally)
   },
@@ -194,6 +196,12 @@ Each service can include a `deploy.json` at the repository root:
   - Can be manually overridden in deploy.json (e.g., `"install": "pnpm install --frozen-lockfile"`)
 - Commands are project-specific (each service defines its own)
 - Health check is optional (falls back to TCP port check if not specified)
+
+**Name resolution (deploy.json overrides):**
+- By default, the local folder name is used for everything (services.json key, systemd unit, server folder)
+- `serviceName` — overrides only the services.json key and systemd unit name
+- `serverFolder` — overrides only the directory name under `/srv/` on the server (defaults to local folder name, NOT serviceName)
+- Example: local folder `sig-booking`, services.json key `bookings` → only need `"serviceName": "bookings"`, server folder stays `sig-booking`
 
 ### Enhanced Deployment Flow (with database)
 
@@ -360,6 +368,7 @@ Then commit and push changes (GitOps workflow).
 
 **Deployment:**
 ```bash
+deploy_preflight            # Validate deployment setup (deploy.json, scripts, remote state)
 deploy                      # Full deploy from current directory
 deploy_status [service]     # Check service status
 deploy_rollback [service]   # Revert to previous commit
