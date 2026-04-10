@@ -28,5 +28,8 @@
   },
   "brain-inbox": {
     "port": 3101
+  },
+  "teetime-vesterby": {
+    "port": 3402
   }
 }
