@@ -31,5 +31,8 @@
   },
   "teetime-vesterby": {
     "port": 3402
+  },
+  "tapscore": {
+    "port": 3737
   }
 }
