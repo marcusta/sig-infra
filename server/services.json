@@ -34,5 +34,8 @@
   },
   "tapscore": {
     "port": 3737
+  },
+  "rudolph": {
+    "port": 3201
   }
 }
