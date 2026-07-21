@@ -2,7 +2,8 @@
   "database": {
     "path": "data/db.sqlite",
     "migrate": "bun run db:migrate",
-    "validate": "bun run db:health"
+    "validate": "bun run db:health",
+    "migrationsDir": "drizzle"
   },
   "install": "bun install",
   "healthCheck": "curl -f http://localhost:3000/health"
@@ -13,3 +14,5 @@
 // - Specify "install" only to override auto-detection (e.g., "pnpm install --frozen-lockfile")
 // - "healthCheck" is optional - defaults to TCP port check
 // - "database" section is optional - only needed for DB migrations
+// - "migrationsDir" is optional - path to migration files (e.g. "drizzle", "migrations").
+//   Enables `deploy_check` and `deploy --auto` to detect if a migration is needed.

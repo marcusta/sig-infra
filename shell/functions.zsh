@@ -342,51 +342,9 @@ app_maint() {
 # Deployment
 # =============================================================================
 
-# Internal helper: Backup database on server and upload migrated version
-_deploy_db_backup_and_upload() {
-  local service_name=$1
-  local db_path=$2
-  local server_folder=${3:-$service_name}
-
-  echo "💾 Backing up database on server..."
-  # Use single quotes for bash -c to avoid quoting issues, expand variables before sending
-  ssh -t $SIG_SERVER "sudo -u $server_folder bash -c 'cd /srv/$server_folder && if [ -f $db_path.backup.1 ]; then mv $db_path.backup.1 $db_path.backup.2; fi && if [ -f $db_path ]; then cp $db_path $db_path.backup.1; fi'" || {
-    echo "❌ Failed to backup database"
-    return 1
-  }
-
-  echo "📤 Uploading deploy-tmp/db.sqlite → /srv/$server_folder/$db_path"
-  # Upload to tmp first (marcus can write there), then move with sudo
-  scp "deploy-tmp/db.sqlite" "$SIG_SERVER:/tmp/$service_name-db.new" || {
-    echo "❌ Failed to upload database"
-    return 1
-  }
-
-  ssh -t $SIG_SERVER "sudo mv /tmp/$service_name-db.new /srv/$server_folder/$db_path.new && \
-    sudo chown $server_folder:$server_folder /srv/$server_folder/$db_path.new && \
-    sudo -u $server_folder mv /srv/$server_folder/$db_path.new /srv/$server_folder/$db_path" || {
-    echo "❌ Failed to move database into place"
-    return 1
-  }
-
-  echo "✅ Database uploaded and activated"
-}
-
-# Internal helper: Rollback database from backup
-_deploy_db_rollback() {
-  local service_name=$1
-  local db_path=$2
-  local server_folder=${3:-$service_name}
-
-  echo "⏪ Rolling back database..."
-  ssh -t $SIG_SERVER "cd /srv/$server_folder && \
-    if [ -f $db_path.backup.1 ]; then \
-      sudo -u $server_folder cp $db_path.backup.1 $db_path; \
-      echo '✅ Database rolled back to backup.1'; \
-    else \
-      echo '⚠️  No backup found to restore'; \
-    fi"
-}
+# NOTE: The database migration workflow runs server-side in server/deploy.ts
+# (snapshot → migrate → validate → backup → swap). Nothing DB-related happens
+# on the local machine during a deploy anymore.
 
 deploy_preflight() {
   local service_name=$(basename "$PWD")
@@ -613,24 +571,111 @@ deploy_preflight() {
   fi
 }
 
+# Print deploy usage / help
+_deploy_usage() {
+  cat <<'EOF'
+Usage: deploy <mode>
+
+A mode is required — bare `deploy` does nothing but print this help.
+
+Modes:
+  --no-db    Code-only deploy. Skips the database workflow entirely.
+             Use when no schema change.
+  --db       Full deploy WITH database migration. Runs ON THE SERVER:
+             stop service → snapshot (VACUUM INTO) → migrate → validate
+             → backup → swap (+ clear WAL/SHM sidecars) → start.
+             Use when this deploy adds or changes migrations.
+  --auto     Detect: if migration files changed since the deployed commit,
+             run --db; otherwise --no-db. Needs "database.migrationsDir" in deploy.json.
+  --help     Show this help.
+
+Tip: run `deploy_check` first to see whether the next deploy needs --db or --no-db.
+EOF
+}
+
+# Determine whether migration files changed vs the commit currently deployed on the server.
+# Args: <server_folder> <migrations_dir>
+# Return: 0 = changed, 1 = unchanged, 2 = unknown (no dir / server unreachable / commit missing)
+_deploy_migrations_changed() {
+  local server_folder=$1 migrations_dir=$2
+  [[ -z "$migrations_dir" ]] && return 2
+
+  local remote_commit
+  remote_commit=$(ssh -o ConnectTimeout=5 $SIG_SERVER \
+    "sudo -u $server_folder git -C /srv/$server_folder rev-parse HEAD" 2>/dev/null)
+  [[ -z "$remote_commit" ]] && return 2
+
+  # Ensure the deployed commit exists locally (fetch once if not)
+  git cat-file -e "${remote_commit}^{commit}" 2>/dev/null || git fetch -q origin 2>/dev/null
+  git cat-file -e "${remote_commit}^{commit}" 2>/dev/null || return 2
+
+  # Committed-but-not-yet-deployed migration changes...
+  local committed worktree
+  committed=$(git diff --name-only "$remote_commit" HEAD -- "$migrations_dir" 2>/dev/null)
+  # ...plus uncommitted/untracked migration files (deploy will commit these).
+  worktree=$(git status --porcelain -- "$migrations_dir" 2>/dev/null)
+
+  [[ -n "$committed" || -n "$worktree" ]] && return 0
+  return 1
+}
+
+# Report whether the next deploy from this folder needs a DB migration.
+deploy_check() {
+  local service_name=$(basename "$PWD")
+  local server_folder="$service_name"
+
+  [[ ! -f "deploy.json" ]] && { echo "❌ No deploy.json in $PWD"; return 1; }
+
+  local name_override=$(jq -r '.serviceName // empty' deploy.json 2>/dev/null)
+  [[ -n "$name_override" ]] && service_name="$name_override"
+  local folder_override=$(jq -r '.serverFolder // empty' deploy.json 2>/dev/null)
+  [[ -n "$folder_override" ]] && server_folder="$folder_override"
+
+  local db_path=$(jq -r '.database.path // empty' deploy.json)
+  if [[ -z "$db_path" ]]; then
+    echo "ℹ️  No database configured → use: deploy --no-db"
+    return 1
+  fi
+
+  local migrations_dir=$(jq -r '.database.migrationsDir // empty' deploy.json)
+  if [[ -z "$migrations_dir" ]]; then
+    echo "⚠️  No \"database.migrationsDir\" in deploy.json — cannot auto-detect."
+    echo "   Add e.g. \"migrationsDir\": \"drizzle\" to the database block,"
+    echo "   or choose explicitly: deploy --db | deploy --no-db"
+    return 2
+  fi
+
+  echo "🔎 Comparing '$migrations_dir' against deployed commit on server..."
+  _deploy_migrations_changed "$server_folder" "$migrations_dir"
+  case $? in
+    0) echo "✅ Migrations changed since last deploy → use: deploy --db"; return 0 ;;
+    1) echo "✅ No migration changes → use: deploy --no-db (fast, no DB transfer)"; return 1 ;;
+    *) echo "⚠️  Could not determine (server unreachable or deployed commit not found locally)."
+       echo "   Choose explicitly: deploy --db | deploy --no-db"; return 2 ;;
+  esac
+}
+
 deploy() {
   local service_name=$(basename "$PWD")
   local server_folder="$service_name"
   local build_config=".build"
   local has_database=false
   local skip_db=false
+  local deploy_mode=""
   local db_path=""
-  local db_migrate_cmd=""
-  local db_validate_cmd=""
+  local migrations_dir=""
   local health_check_cmd=""
 
-  # Parse flags
-  if [[ "$1" == "--no-db" ]]; then
-    skip_db=true
-    shift
-  fi
+  # An explicit mode is required
+  case "$1" in
+    --db)    deploy_mode="db";    shift ;;
+    --no-db) deploy_mode="no-db"; shift ;;
+    --auto)  deploy_mode="auto";  shift ;;
+    -h|--help|"") _deploy_usage; return 0 ;;
+    *) echo "❌ Unknown option: $1"; echo ""; _deploy_usage; return 1 ;;
+  esac
 
-  # Override service name and server folder from deploy.json if present
+  # Override names and read DB config from deploy.json if present
   # serviceName overrides only the services.json key / systemd unit
   # serverFolder overrides only the /srv/ directory (defaults to local folder name)
   if [[ -f "deploy.json" ]]; then
@@ -642,66 +687,48 @@ deploy() {
     if [[ -n "$folder_override" ]]; then
       server_folder="$folder_override"
     fi
+    db_path=$(jq -r '.database.path // empty' deploy.json)
+    migrations_dir=$(jq -r '.database.migrationsDir // empty' deploy.json)
+    health_check_cmd=$(jq -r '.healthCheck // empty' deploy.json)
   fi
+
+  # Resolve --auto into db / no-db
+  if [[ "$deploy_mode" == "auto" ]]; then
+    if [[ -z "$db_path" ]]; then
+      deploy_mode="no-db"
+      echo "🔎 --auto: no database configured → code-only deploy"
+    elif [[ -z "$migrations_dir" ]]; then
+      echo "❌ --auto needs \"database.migrationsDir\" in deploy.json to detect migrations."
+      echo "   Add it, or run: deploy --db | deploy --no-db"
+      return 1
+    else
+      echo "🔎 --auto: comparing '$migrations_dir' against deployed commit..."
+      _deploy_migrations_changed "$server_folder" "$migrations_dir"
+      case $? in
+        0) deploy_mode="db";    echo "   → migrations changed: deploying WITH migration" ;;
+        1) deploy_mode="no-db"; echo "   → no migration changes: code-only deploy" ;;
+        *) echo "❌ --auto could not determine migration state (server unreachable or commit missing locally)."
+           echo "   Run explicitly: deploy --db | deploy --no-db"; return 1 ;;
+      esac
+    fi
+    echo ""
+  fi
+
+  [[ "$deploy_mode" == "no-db" ]] && skip_db=true
 
   echo "🚀 Deploying $service_name (folder: $server_folder)..."
   echo ""
 
-  # Check for deploy.json
-  if [[ -f "deploy.json" ]]; then
-    db_path=$(jq -r '.database.path // empty' deploy.json)
-    if [[ -n "$db_path" ]]; then
-      if [[ "$skip_db" == "true" ]]; then
-        echo "📊 Database configured but skipped (--no-db)"
-      else
-        has_database=true
-        db_migrate_cmd=$(jq -r '.database.migrate' deploy.json)
-        db_validate_cmd=$(jq -r '.database.validate' deploy.json)
-        echo "📊 Database detected: $db_path"
-      fi
+  # Resolve database workflow based on mode
+  if [[ -n "$db_path" ]]; then
+    if [[ "$skip_db" == "true" ]]; then
+      echo "📊 Database configured but skipped (--no-db)"
+    else
+      has_database=true
+      echo "📊 Database migration will run on the server: $db_path"
     fi
-    health_check_cmd=$(jq -r '.healthCheck // empty' deploy.json)
-  fi
-
-  # Database migration workflow
-  if [[ "$has_database" == "true" ]]; then
-    echo ""
-    echo "🔄 Database Migration Workflow"
-    echo "────────────────────────────────────────"
-
-    # 1. Enable maintenance mode
-    echo "🚧 Enabling maintenance mode..."
-    ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
-
-    # 2. Download DB
-    echo "📥 Downloading /srv/$server_folder/$db_path → deploy-tmp/db.sqlite"
-    mkdir -p deploy-tmp
-    scp "$SIG_SERVER:/srv/$server_folder/$db_path" "deploy-tmp/db.sqlite" || {
-      echo "❌ Failed to download database. Aborting."
-      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
-      return 1
-    }
-
-    # 3. Run migration
-    echo "🔄 Running migration on deploy-tmp/db.sqlite"
-    echo "   DB_PATH=deploy-tmp/db.sqlite $db_migrate_cmd"
-    ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$db_migrate_cmd" ) || {
-      echo "❌ Migration failed. Aborting."
-      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
-      return 1
-    }
-
-    # 4. Run validation
-    echo "🔍 Running validation on deploy-tmp/db.sqlite"
-    echo "   DB_PATH=deploy-tmp/db.sqlite $db_validate_cmd"
-    ( export DB_PATH="deploy-tmp/db.sqlite" && eval "$db_validate_cmd" ) || {
-      echo "❌ Validation failed. Aborting."
-      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
-      return 1
-    }
-
-    echo "✅ Migration and validation successful"
-    echo ""
+  elif [[ "$deploy_mode" == "db" ]]; then
+    echo "⚠️  --db requested but no database configured in deploy.json — continuing code-only"
   fi
 
   # Step 1: Local build (optional)
@@ -729,17 +756,7 @@ deploy() {
   git push origin $(git rev-parse --abbrev-ref HEAD) || { echo "❌ Push failed."; return 1; }
   echo ""
 
-  # Step 3: Upload database if migrated
-  if [[ "$has_database" == "true" ]]; then
-    _deploy_db_backup_and_upload "$service_name" "$db_path" "$server_folder" || {
-      echo "❌ Database upload failed. Aborting."
-      ssh -t $SIG_SERVER "cd $SIG_INFRA_REMOTE/server && bun generate.ts maint $service_name" 2>/dev/null
-      return 1
-    }
-    echo ""
-  fi
-
-  # Step 4: Remote deployment
+  # Step 3: Remote deployment (server handles maintenance, DB workflow, health check, recovery)
   echo "🌐 Running remote deployment..."
   echo "────────────────────────────────────────"
 
@@ -747,32 +764,27 @@ deploy() {
   if [[ "$server_folder" != "$service_name" ]]; then
     deploy_cmd="$deploy_cmd --folder $server_folder"
   fi
+  if [[ "$has_database" == "true" ]]; then
+    deploy_cmd="$deploy_cmd --db"
+  fi
   if [[ -n "$health_check_cmd" ]]; then
     deploy_cmd="$deploy_cmd --health-check '$health_check_cmd'"
   fi
 
   if ! ssh -t $SIG_SERVER "$deploy_cmd"; then
     echo "────────────────────────────────────────"
-    echo "❌ Deployment failed!"
-
-    # Rollback database if it was involved
-    if [[ "$has_database" == "true" ]]; then
-      echo ""
-      _deploy_db_rollback "$service_name" "$db_path" "$server_folder"
-    fi
-
+    echo "❌ Deployment failed! (server attempted auto-recovery to the previous version)"
     echo ""
     echo "Useful commands:"
     echo "  deploy_status $service_name"
-    echo "  deploy_rollback $service_name"
-    echo "  ssh $SIG_SERVER 'sudo journalctl -u $service_name -n 50'"
+    echo "  ssh $SIG_SERVER 'sudo journalctl -u $server_folder -n 50'"
     return 1
   fi
 
   echo "────────────────────────────────────────"
   echo ""
 
-  # Step 5: Tail logs
+  # Step 4: Tail logs
   echo "📋 Tailing logs (Ctrl+C to exit)..."
   echo "────────────────────────────────────────"
   ssh -t $SIG_SERVER "sudo journalctl -u $server_folder -f -n 20"
@@ -783,14 +795,41 @@ deploy_status() {
   ssh -t $SIG_SERVER "bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name --status"
 }
 
+# Usage: deploy_rollback [service] [--db]
+#   --db also restores the database from backup.1 (use after a failed --db deploy)
 deploy_rollback() {
-  local service_name=${1:-$(basename "$PWD")}
+  local service_name=""
+  local db_flag=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --db) db_flag="--db" ;;
+      *) service_name="$arg" ;;
+    esac
+  done
+  [[ -z "$service_name" ]] && service_name=$(basename "$PWD")
+  local server_folder="$service_name"
+
+  # Resolve overrides when run from a project directory
+  if [[ -f "deploy.json" ]]; then
+    local name_override=$(jq -r '.serviceName // empty' deploy.json 2>/dev/null)
+    [[ -n "$name_override" ]] && service_name="$name_override"
+    local folder_override=$(jq -r '.serverFolder // empty' deploy.json 2>/dev/null)
+    [[ -n "$folder_override" ]] && server_folder="$folder_override"
+  fi
 
   echo "⚠️  This will rollback $service_name to the previous commit."
+  [[ -n "$db_flag" ]] && echo "⚠️  It will ALSO restore the database from backup.1."
   read -r "confirm?Are you sure? (y/n): "
   [[ "$confirm" != "y" ]] && { echo "Cancelled."; return 0; }
 
-  ssh -t $SIG_SERVER "bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name --rollback"
+  local rollback_cmd="bun $SIG_INFRA_REMOTE/server/deploy.ts $service_name --rollback"
+  if [[ "$server_folder" != "$service_name" ]]; then
+    rollback_cmd="$rollback_cmd --folder $server_folder"
+  fi
+  [[ -n "$db_flag" ]] && rollback_cmd="$rollback_cmd --db"
+
+  ssh -t $SIG_SERVER "$rollback_cmd"
 }
 
 # =============================================================================
@@ -829,10 +868,21 @@ db_pull() {
   echo "📥 Downloading production database for $service_name..."
   mkdir -p deploy-tmp
 
-  scp "$SIG_SERVER:/srv/$server_folder/$db_path" "deploy-tmp/db.sqlite" || {
-    echo "❌ Failed to download database"
+  # Snapshot with VACUUM INTO first — a raw scp of a WAL-mode database misses
+  # anything still in the -wal sidecar. The snapshot is one consistent file.
+  local snapshot="/tmp/$service_name-db.snapshot"
+  ssh -t $SIG_SERVER "sudo -u $server_folder bun $SIG_INFRA_REMOTE/server/db-tool.ts snapshot /srv/$server_folder/$db_path $snapshot && sudo chmod 644 $snapshot" || {
+    echo "❌ Failed to snapshot database on server"
     return 1
   }
+
+  scp "$SIG_SERVER:$snapshot" "deploy-tmp/db.sqlite" || {
+    echo "❌ Failed to download database"
+    ssh -t $SIG_SERVER "sudo rm -f $snapshot" 2>/dev/null
+    return 1
+  }
+
+  ssh -t $SIG_SERVER "sudo rm -f $snapshot" 2>/dev/null
 
   echo "✅ Database downloaded to: deploy-tmp/db.sqlite"
   echo ""
@@ -906,9 +956,10 @@ db_validate_test() {
 helpme_sig_infra() {
   echo ""
   echo "--- DEPLOYMENT ---"
-  echo "deploy         : Deploy current folder to server (--no-db to skip database)"
+  echo "deploy         : Deploy current folder (mode required: --db | --no-db | --auto)"
+  echo "deploy_check   : Report whether next deploy needs --db or --no-db"
   echo "deploy_status  : Check service status (deploy_status [service])"
-  echo "deploy_rollback: Rollback to previous commit"
+  echo "deploy_rollback: Rollback to previous commit (--db: also restore DB backup.1)"
   echo "deploy_preflight: Pre-deploy checks"
   echo ""
   echo "--- DATABASE ---"
@@ -1003,7 +1054,7 @@ compdef _caddy_remove_completion caddy_remove
 compdef _caddy_status_completion caddy_status
 compdef _caddy_regen_completion caddy_regen
 compdef _infra_push_completion infra_push
-compdef '_arguments "1:option:(--no-db)"' deploy
+compdef '_arguments "1:mode:(--db --no-db --auto --help)"' deploy
 compdef '_arguments "1:service:($(_get_caddy_services))"' deploy_status
 compdef '_arguments "1:service:($(_get_caddy_services))"' deploy_rollback
 

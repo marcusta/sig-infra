@@ -164,7 +164,9 @@ Returns structured JSON with all status information for each service.
 
 ## Database Migration Support
 
-Services can optionally include database migration and validation in their deployment workflow. Migrations run **locally** before deployment, with automatic backup and rollback on failure.
+Services can optionally include database migration and validation in their deployment workflow. Migrations run **on the server** (against a `VACUUM INTO` snapshot, with the service stopped), with automatic backup and auto-recovery on failure. The live database is only ever replaced by a file that already migrated and validated.
+
+**WAL awareness:** SQLite in WAL mode is *three* files (`db.sqlite`, `-wal`, `-shm`). Copying or replacing only `db.sqlite` while sidecars exist corrupts the database — SQLite replays the stale WAL over the new file on boot. All snapshot/swap/restore operations therefore go through `server/db-tool.ts` (`VACUUM INTO` snapshots) and always remove sidecars when replacing the main file.
 
 **For service developers:** See [SERVICE-DATABASE-GUIDE.md](./SERVICE-DATABASE-GUIDE.md) for complete implementation instructions.
 
@@ -180,8 +182,8 @@ Each service can include a `deploy.json` at the repository root:
   "serverFolder": "sig-booking",        // Optional: override server directory under /srv/
   "database": {
     "path": "data/db.sqlite",           // Path on server (relative to /srv/{serverFolder}/)
-    "migrate": "bun run db:migrate",    // Migration command (runs locally)
-    "validate": "bun run db:health"     // Validation command (runs locally)
+    "migrate": "bun run db:migrate",    // Migration command (runs on server, as service user)
+    "validate": "bun run db:health"     // Validation command (runs on server, as service user)
   },
   "install": "bun install",             // Optional: Auto-detected from lockfile, or manually override
   "healthCheck": "curl -f http://localhost:3000/health"  // Optional custom health check
@@ -189,8 +191,8 @@ Each service can include a `deploy.json` at the repository root:
 ```
 
 **Key principles:**
-- Migration/validation commands run in **project root** working directory on **local machine**
-- Database path provided via **DB_PATH environment variable**: `DB_PATH=deploy-tmp/db.sqlite`
+- Migration/validation commands run on the **server**, as the **service user**, with cwd `/srv/{serverFolder}` — against a snapshot, never the live file
+- Database path provided via **DB_PATH environment variable** (points at the snapshot during deploys, at `deploy-tmp/db.sqlite` during local rehearsal with `db_migrate_test`)
 - Install command runs on **server** after git pull
   - **Auto-detected** from lockfile if not specified (bun.lockb → bun install, package-lock.json → npm install, etc.)
   - Can be manually overridden in deploy.json (e.g., `"install": "pnpm install --frozen-lockfile"`)
@@ -206,27 +208,38 @@ Each service can include a `deploy.json` at the repository root:
 ### Enhanced Deployment Flow (with database)
 
 ```
-Local                           Server
+Local                           Server (deploy.ts <service> --db)
 ─────                           ──────
-1. Check for deploy.json
-2. If database config exists:
-   a. Download DB to deploy-tmp/
-   b. Run migration locally
-   c. Run validation locally
-   d. If valid:                 → Backup DB (rotate: .1→.2, current→.1)
-   e. Upload migrated DB        → Receive and activate new DB
-3. Optional build (if .build exists)
-4. Git commit + push  ────────→
-                                5. Maintenance mode ON
-                                6. Git pull (as service user)
-                                7. Install dependencies (if configured)
-                                8. Systemctl restart
-                                9. Health check (TCP or custom)
-                                10. Maintenance mode OFF
+1. Optional build (if .build exists)
+2. Git commit + push  ────────→
+                                3. Record deployed commit (recovery target)
+                                4. Maintenance mode ON
+                                5. Git pull (as service user)
+                                6. Install dependencies (if configured)
+                                7. STOP service (nothing may write to the DB)
+                                8. Snapshot: VACUUM INTO db.migrating
+                                9. Migrate snapshot  (DB_PATH=db.migrating)
+                                10. Validate snapshot (DB_PATH=db.migrating)
+                                11. Rotate backups (.1→.2, VACUUM INTO → .1)
+                                12. Swap: mv db.migrating → db.sqlite
+                                    + rm -f *-wal *-shm (critical!)
+                                13. Integrity check in final location
+                                14. Start service
+                                15. Health check (TCP or custom)
+                                16. Maintenance mode OFF
                                 ←────────────────── Success/Fail
-                                11. If fail: rollback DB + code
-12. Tail logs via journalctl
+                                On fail: auto-recover — git reset to
+                                recorded commit, reinstall, restore
+                                backup.1 (only if DB was swapped),
+                                restart. If recovery fails: stays in
+                                maintenance.
+17. Tail logs via journalctl
 ```
+
+**Failure semantics:**
+- Migration/validation fails → live DB was never touched; code auto-reverts; failed snapshot kept at `{db}.migrating` for debugging
+- Health check fails after swap → code auto-reverts AND backup.1 is restored (sidecars cleared)
+- Recovery itself fails → service stays in maintenance; fix manually or run `deploy_rollback <service> --db`
 
 ### Database Backup Strategy
 
@@ -234,19 +247,21 @@ Each deployment creates numbered backups on the server:
 - `db.sqlite.backup.1` - Latest backup (from current deployment)
 - `db.sqlite.backup.2` - Previous backup (from prior deployment)
 
-Rotation happens automatically:
+Rotation happens automatically (with the service stopped):
 1. `backup.1` → `backup.2` (if exists)
-2. `current` → `backup.1`
-3. `uploaded` → `current`
+2. `VACUUM INTO` current → `backup.1` (consistent single-file snapshot, WAL folded in)
+3. migrated snapshot → `current` (sidecars removed in the same step)
+
+Restoring a backup always clears `-wal`/`-shm` sidecars — restoring the main file next to stale sidecars reproduces the corruption the workflow exists to prevent.
 
 ### Local Development Workflow
 
-Test migrations against production data locally:
+Rehearse migrations against production data locally (this is a rehearsal only — the deploy itself re-runs the migration on the server):
 
 ```bash
 cd ~/projects/my-service
 
-db_pull                    # Download prod DB to deploy-tmp/db.sqlite
+db_pull                    # Snapshot prod DB on server (VACUUM INTO), download to deploy-tmp/db.sqlite
 db_migrate_test            # Run migration on downloaded DB (sets DB_PATH)
 db_validate_test           # Validate migration
 
@@ -413,9 +428,15 @@ bun generate.ts maint my-service
 
 # Deployment (usually triggered from local)
 bun deploy.ts my-service
+bun deploy.ts my-service --db        # with server-side database migration
 bun deploy.ts my-service --status
-bun deploy.ts my-service --rollback
+bun deploy.ts my-service --rollback          # code only
+bun deploy.ts my-service --rollback --db     # code + restore DB backup.1
 bun deploy.ts my-service --health-check 'curl -f http://localhost:3000/health'
+
+# SQLite helpers (run as service user)
+sudo -u my-service bun db-tool.ts snapshot /srv/my-service/data/db.sqlite /tmp/snap.sqlite
+sudo -u my-service bun db-tool.ts integrity /srv/my-service/data/db.sqlite
 ```
 
 **Server-side convenience functions** (in `server/.bashrc` for reference):
@@ -432,7 +453,8 @@ sig-infra/
 ├── server/
 │   ├── status.ts                   # Service status checker (systemd, port, HTTP)
 │   ├── generate.ts                 # Caddyfile generator (add/remove/maint/list)
-│   ├── deploy.ts                   # Server-side deployment orchestrator
+│   ├── deploy.ts                   # Server-side deployment orchestrator (incl. DB workflow)
+│   ├── db-tool.ts                  # SQLite helper: snapshot (VACUUM INTO), checkpoint, integrity
 │   ├── services.json               # Service structure (tracked in git)
 │   ├── services-state.json.example # Template for operational state
 │   └── .bashrc                     # Reference copy of server bashrc (rfu/rbu helpers)
@@ -512,15 +534,16 @@ const merged = { ...structure[name], live: state[name]?.live ?? true };
 
 ### deploy.ts Modes
 
-1. **deploy** (default) — Full deployment with health checks, toggles state file
-2. **--status** — Check service status (systemd + Caddy)
-3. **--rollback** — Git reset to HEAD~1 and redeploy
+1. **deploy** (default) — Full deployment with health checks, toggles state file, auto-recovers to the pre-deploy commit on failure
+2. **--db** — Include the server-side database workflow (stop → snapshot → migrate → validate → backup → swap → integrity check → start)
+3. **--status** — Check service status (systemd + Caddy)
+4. **--rollback [--db]** — Git reset to HEAD~1 and redeploy; `--db` also restores database backup.1
 
 ### Health Checks
 
-- Uses `nc -z localhost {port}` for TCP check
+- Uses `nc -z localhost {port}` for TCP check (or custom `--health-check` command)
 - Retries 10 times with 1s delay
-- If unhealthy, deployment fails and service stays in maintenance
+- If unhealthy, deploy.ts auto-recovers to the previous commit (and previous DB if swapped); only if recovery also fails does the service stay in maintenance
 
 ## Adding a New Service
 
@@ -557,14 +580,21 @@ If you need more control or already have parts set up:
 
 If a deployment fails:
 
+Deploys auto-recover on failure (code reset to the pre-deploy commit, DB restored from backup.1 if it was swapped). Manual rollback is for when auto-recovery itself failed:
+
 ```bash
 # Automatic (recommended)
-deploy_rollback my-service
+deploy_rollback my-service          # code only
+deploy_rollback my-service --db     # code + restore DB backup.1 (clears WAL/SHM sidecars)
 
 # Manual
 ssh marcus@app.swedenindoorgolf.se
+sudo systemctl stop my-service                      # stop BEFORE touching code or DB
 cd /srv/my-service
 sudo -u my-service git reset --hard HEAD~1
+# If the DB needs restoring (never restore next to stale sidecars):
+sudo -u my-service cp data/db.sqlite.backup.1 data/db.sqlite
+sudo -u my-service rm -f data/db.sqlite-wal data/db.sqlite-shm
 sudo systemctl restart my-service
 cd /srv/infra/server && bun generate.ts maint my-service  # toggle off maintenance
 ```
