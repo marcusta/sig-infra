@@ -147,4 +147,4 @@ server/services-state.json
 
 # Database migration artifacts (local development)
 deploy-tmp/
-deploy.json
+deploy.json.claude/worktrees/
