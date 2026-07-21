@@ -5,12 +5,15 @@ This guide is for developers of individual services (e.g., `golf-serie`, `bookin
 ## Overview
 
 The deployment system supports **optional** database migration with:
-- Local migration execution (migrations run on your dev machine, not on the server)
-- Automatic backup and rollback on failure
-- Local development testing with production data
+- **Server-side migration execution** — migrations run on the server, as the service user, against a snapshot of the live database (never against the live file directly)
+- Automatic backup rotation and auto-recovery on failure
+- WAL-safe snapshot/swap/restore operations (via `server/db-tool.ts`)
+- Local rehearsal against production data (`db_pull` / `db_migrate_test` / `db_validate_test`)
 - Custom health checks after deployment
 
-**This is completely optional** - services without database configuration deploy normally.
+**This is completely optional** — services without database configuration deploy normally.
+
+**Why server-side?** SQLite in WAL mode is *three* files (`db.sqlite`, `-wal`, `-shm`). Downloading/uploading only the main file while sidecars exist corrupts the database — SQLite replays the stale WAL over the new file on boot. The server-side workflow stops the service first, snapshots with `VACUUM INTO` (which folds the WAL into one consistent file), migrates the snapshot, and always removes sidecars when swapping files. The live database is only ever replaced by a file that has already migrated and validated.
 
 ## Quick Start
 
@@ -18,8 +21,9 @@ To enable database migration support for your service:
 
 1. Create `deploy.json` in your repository root
 2. Add migration and validation scripts
-3. Test locally with `db_pull` and `db_migrate_test`
-4. Deploy normally - migrations happen automatically
+3. Validate the setup with `deploy_preflight`
+4. Rehearse locally with `db_pull` and `db_migrate_test`
+5. Deploy with `deploy --db` — the migration runs on the server automatically
 
 ## Configuration File (deploy.json)
 
@@ -32,11 +36,15 @@ Create `deploy.json` in your service repository root:
   "database": {
     "path": "data/db.sqlite",
     "migrate": "bun run db:migrate",
-    "validate": "bun run db:health"
+    "validate": "bun run db:health",
+    "migrationsDir": "drizzle"
   },
+  "install": "bun install",
   "healthCheck": "curl -f http://localhost:3000/health"
 }
 ```
+
+**Note:** The server reads `deploy.json` *after* `git pull` — so your migration commands always ship together with the code that needs them.
 
 ### Configuration Fields
 
@@ -59,23 +67,33 @@ Create `deploy.json` in your service repository root:
 
 #### `database.migrate` (required if using database)
 - Shell command to run migration
-- Executed in your **project root** on your **local machine**
+- Executed **on the server**, as the **service user**, with cwd `/srv/{serverFolder}`
+- Runs against a snapshot — the `DB_PATH` environment variable points at the snapshot file, never the live database
 - Example: `"bun run db:migrate"` or `"npm run migrate"`
-- Environment variable `DB_PATH` points to the database file
 
 #### `database.validate` (required if using database)
 - Shell command to validate migration succeeded
-- Executed in your **project root** on your **local machine**
+- Executed **on the server**, as the **service user**, with cwd `/srv/{serverFolder}`
+- Runs against the migrated snapshot (`DB_PATH` points at it)
 - Must exit with code 0 for success, non-zero for failure
 - Example: `"bun run db:health"` or `"npm run db:validate"`
-- Environment variable `DB_PATH` points to the database file
+
+#### `database.migrationsDir` (optional)
+- Path to your migration files (e.g., `"drizzle"`, `"migrations"`)
+- Enables `deploy_check` and `deploy --auto` to detect whether the next deploy needs a migration (by diffing this directory against the commit currently deployed on the server)
+- Without it, you must choose `deploy --db` / `deploy --no-db` yourself
+
+#### `install` (optional)
+- Command to install dependencies on the server after `git pull`
+- Auto-detected from lockfile if omitted (`bun.lockb`/`bun.lock` → `bun install`, `package-lock.json` → `npm install`, etc.)
+- Only specify to override auto-detection (e.g., `"pnpm install --frozen-lockfile"`)
 
 #### `healthCheck` (optional)
 - Custom health check command to run on the server after deployment
 - Executed on the **server** after service restart
 - Must exit with code 0 for success, non-zero for failure
 - Example: `"curl -f http://localhost:3000/health"`
-- If omitted, uses TCP port check (existing behavior)
+- If omitted, uses TCP port check (`nc -z localhost {port}`)
 
 ## Implementation Steps
 
@@ -97,7 +115,9 @@ Create `scripts/migrate.ts` (or `.js`):
 ```typescript
 import { Database } from "bun:sqlite";
 
-// Read database path from environment variable
+// Read database path from environment variable.
+// During deploys the server sets DB_PATH to the snapshot file;
+// during local rehearsal (db_migrate_test) it points at deploy-tmp/db.sqlite.
 const dbPath = process.env.DB_PATH || "data/db.sqlite";
 const db = new Database(dbPath);
 
@@ -131,10 +151,10 @@ try {
 ```
 
 **Key points:**
-- Read `DB_PATH` from environment (deployment sets this to `deploy-tmp/db.sqlite`)
+- Read `DB_PATH` from environment — the deploy sets it to the snapshot on the server; `db_migrate_test` sets it to `deploy-tmp/db.sqlite` locally
 - Fall back to your normal dev DB path if not set
 - Exit with code 0 on success, non-zero on failure
-- Use idempotent operations (`IF NOT EXISTS`, etc.) when possible
+- Use idempotent operations (`IF NOT EXISTS`, etc.) when possible — the same migration runs once in rehearsal and once for real on the server
 
 ### Step 3: Create Validation Script
 
@@ -186,7 +206,7 @@ try {
 - Verify your schema is in the expected state
 - Check tables, columns, indexes exist
 - Exit with code 0 on success, non-zero on failure
-- Be thorough - this prevents deploying broken migrations
+- Be thorough — on the server, this is the last gate before the migrated snapshot replaces the live database
 
 ### Step 4: Add Health Check Endpoint (Optional)
 
@@ -226,47 +246,57 @@ deploy-tmp/
 *.local-backup
 ```
 
+(`deploy-tmp/` is only used for local rehearsal — it never gets deployed.)
+
 ## Deployment Workflow
 
-When you run `deploy` from your service directory:
+Deploy requires an explicit mode:
 
-### With Database Configuration:
+```bash
+deploy --db      # Full deploy WITH server-side database migration
+deploy --no-db   # Code-only deploy, skips the database workflow
+deploy --auto    # Detect: --db if migration files changed, else --no-db
+                 # (needs "database.migrationsDir" in deploy.json)
+```
 
-1. **Pre-deployment (local):**
-   - Detects `deploy.json` with database config
-   - Enables maintenance mode on server
-   - Downloads production database to `deploy-tmp/db.sqlite`
-   - Runs `DB_PATH=deploy-tmp/db.sqlite bun run db:migrate`
-   - Runs `DB_PATH=deploy-tmp/db.sqlite bun run db:health`
-   - If validation fails → aborts, disables maintenance mode
+Run `deploy_check` first if you're unsure whether the next deploy needs `--db`.
 
-2. **Database Upload:**
-   - Server rotates backups: `.backup.1` → `.backup.2`, `current` → `.backup.1`
-   - Uploads migrated DB to server
-   - Swaps new DB into place
+### With `--db` (database migration):
 
-3. **Code Deployment:**
-   - Runs local build (if `.build` exists)
+1. **Local:**
+   - Optional build (if `.build` exists)
    - Git commit and push
-   - Server pulls latest code
-   - Server restarts service
 
-4. **Health Check:**
-   - Runs custom health check (if specified) or TCP port check
-   - If check fails → rollbacks both database and code
-
-5. **Finalization:**
+2. **Server** (`deploy.ts <service> --db`):
+   - Records the currently deployed commit (recovery target)
+   - Enables maintenance mode
+   - `git pull` (as service user)
+   - Reads `deploy.json` (from the freshly pulled code)
+   - Installs dependencies (from `install` or lockfile auto-detection)
+   - **Stops the service** — nothing may write to the DB during the window
+   - Snapshots the database: `VACUUM INTO {db}.migrating` (folds WAL into one consistent file)
+   - Runs your migrate command with `DB_PATH={db}.migrating`
+   - Runs your validate command with `DB_PATH={db}.migrating`
+   - Rotates backups: `backup.1` → `backup.2`, `VACUUM INTO` current → `backup.1`
+   - Swaps: `mv {db}.migrating` → `{db}` **and removes `-wal`/`-shm` sidecars in the same step**
+   - Runs an integrity check on the file in its final location
+   - Starts the service
+   - Health check (custom command or TCP port)
    - Disables maintenance mode
-   - Tails logs
 
-### Without Database Configuration:
+3. **On failure — auto-recovery:**
+   - Git reset to the recorded commit, reinstall dependencies
+   - Database restored from `backup.1` **only if it was already swapped** (if migration/validation failed, the live DB was never touched)
+   - Service restarted, maintenance lifted if healthy
+   - If recovery itself fails, the service stays in maintenance mode
 
-Works exactly as before:
-1. Local build (if `.build` exists)
-2. Git commit and push
-3. Server deployment
-4. Health check (TCP port)
-5. Tail logs
+4. **Local:** Tails logs via journalctl
+
+### With `--no-db` (code only):
+
+1. Optional local build, git commit and push
+2. Server: maintenance on → git pull → install deps → restart → health check → maintenance off (with the same auto-recovery on failure)
+3. Tail logs
 
 ## Preflight Validation
 
@@ -280,21 +310,21 @@ deploy_preflight
 
 This verifies:
 - `deploy.json` is valid with required fields
-- Migration/validation scripts exist and reference `DB_PATH` env var
+- Migration/validation scripts exist and reference the `DB_PATH` env var
 - `package.json` has the required scripts
 - Remote service, database, and systemd unit exist
 - `.gitignore` includes `deploy-tmp/`
 
 **Run this first** when setting up migration support for a new service. It catches common issues like missing scripts, wrong paths, or scripts that ignore the `DB_PATH` environment variable.
 
-## Local Development Testing
+## Local Rehearsal
 
-After preflight passes, test your migration against production data:
+After preflight passes, rehearse your migration against production data. **This is a rehearsal only** — the deploy re-runs the same migration on the server; nothing from `deploy-tmp/` is ever uploaded.
 
 ```bash
 cd ~/projects/your-service
 
-# Download production database
+# Snapshot prod DB on the server (VACUUM INTO), download to deploy-tmp/db.sqlite
 db_pull
 
 # Run migration on the downloaded DB (sets DB_PATH=deploy-tmp/db.sqlite)
@@ -307,7 +337,7 @@ db_validate_test
 sqlite3 deploy-tmp/db.sqlite
 ```
 
-**Important:** Check the migration output path. It should show `deploy-tmp/db.sqlite`, not your fallback path. If it shows the fallback (e.g., `data/db.sqlite`), your script is not reading `DB_PATH` correctly and the deploy will upload an un-migrated database.
+**Important:** Check the migration output path. It should show `deploy-tmp/db.sqlite`, not your fallback path. If it shows the fallback (e.g., `data/db.sqlite`), your script is not reading `DB_PATH` correctly — and on the server the deploy would migrate the wrong file.
 
 This lets you:
 - Test migrations against real production data structure
@@ -315,50 +345,52 @@ This lets you:
 - Confirm `DB_PATH` is being read correctly
 - Catch issues before deploying
 
-## Backup and Rollback
+## Backup and Recovery
 
 ### Automatic Backups
 
-Each deployment creates numbered backups on the server:
-- `db.sqlite.backup.1` - Latest backup (from current deployment)
-- `db.sqlite.backup.2` - Previous backup (from prior deployment)
+Each `--db` deployment creates numbered backups on the server:
+- `db.sqlite.backup.1` — Latest backup (from current deployment)
+- `db.sqlite.backup.2` — Previous backup (from prior deployment)
 
-Rotation happens automatically before upload.
+Rotation happens automatically **with the service stopped**, using `VACUUM INTO` — so each backup is a single consistent file with the WAL folded in.
 
-### Automatic Rollback
+### Automatic Recovery
 
-If deployment fails (migration, validation, or health check):
-- Database is restored from `.backup.1`
-- Code is reverted via `git reset --hard HEAD~1`
-- Service stays in maintenance mode
-- You're notified of the failure
+If a `--db` deployment fails, the server auto-recovers:
+
+- **Migration or validation failed** → the live DB was never touched. Code is reset to the pre-deploy commit and the service restarts on the old version. The failed snapshot is kept at `{db}.migrating` for debugging.
+- **Health check failed after the swap** → code is reset AND the database is restored from `backup.1` (with `-wal`/`-shm` sidecars cleared).
+- **Recovery itself failed** → the service stays in maintenance mode; fix manually or run `deploy_rollback`.
 
 ### Manual Rollback
 
-If you need to rollback manually:
+If auto-recovery failed, or you need to revert a successful deploy:
 
 ```bash
-deploy_rollback your-service
+deploy_rollback your-service          # code only (git reset HEAD~1, restart)
+deploy_rollback your-service --db     # code + restore database from backup.1
 ```
 
-This:
-- Reverts code to previous commit
-- Restarts service
-- Runs health check
-- Removes maintenance mode
+The `--db` variant restores `backup.1` and clears the `-wal`/`-shm` sidecars in the same step.
 
-**Note:** Manual rollback does NOT restore the database. If you need to restore the database manually:
+Fully manual (on the server):
 
 ```bash
 ssh marcus@app.swedenindoorgolf.se
+sudo systemctl stop your-service                    # stop BEFORE touching code or DB
 cd /srv/your-service
+sudo -u your-service git reset --hard HEAD~1
+# If the DB needs restoring (never restore next to stale sidecars):
 sudo -u your-service cp data/db.sqlite.backup.1 data/db.sqlite
+sudo -u your-service rm -f data/db.sqlite-wal data/db.sqlite-shm
 sudo systemctl restart your-service
+cd /srv/infra/server && bun generate.ts maint your-service  # toggle off maintenance
 ```
 
 ## Troubleshooting
 
-### Migration fails locally
+### Migration fails in local rehearsal
 
 Check:
 - Is `DB_PATH` being read correctly in your script?
@@ -366,12 +398,14 @@ Check:
 - Are you using idempotent operations?
 - Run `DB_PATH=deploy-tmp/db.sqlite bun run db:migrate` manually
 
-### Validation fails
+### Migration or validation fails during deploy
+
+The live database was **not** touched — the failure happened on the snapshot. The service is back on the previous code version (auto-recovery).
 
 Check:
-- Does your validation script correctly check the schema?
-- Did the migration actually apply?
-- Inspect with: `sqlite3 deploy-tmp/db.sqlite ".schema"`
+- The deploy output shows the exact command and `DB_PATH` used
+- Inspect the failed snapshot on the server: `ssh server 'sudo -u your-service sqlite3 /srv/your-service/data/db.sqlite.migrating ".schema"'`
+- Did the rehearsal (`db_pull && db_migrate_test`) pass? If prod data changed since, pull again
 
 ### Health check fails after deployment
 
@@ -381,11 +415,23 @@ Check:
 - Can you curl the endpoint manually?
 - Try deploying without custom health check first (remove from deploy.json)
 
+Note: if this happens on a `--db` deploy, auto-recovery already restored `backup.1` — the data written between swap and failed health check (there shouldn't be any, the service just started) is gone with the snapshot.
+
 ### Database not found
 
 Check:
 - Is `database.path` in deploy.json correct?
 - Does the file exist on the server? `ssh server 'ls -la /srv/your-service/data/'`
+
+### Service stuck in maintenance mode
+
+Auto-recovery failed. Diagnose on the server:
+
+```bash
+ssh server 'sudo systemctl status your-service'
+ssh server 'sudo journalctl -u your-service -n 50'
+deploy_rollback your-service --db
+```
 
 ## Best Practices
 
@@ -405,7 +451,9 @@ if (!columns.some(c => c.name === "email")) {
 }
 ```
 
-### 2. Test Against Production Data
+This matters doubly here: the migration runs once in rehearsal and once for real on the server.
+
+### 2. Rehearse Against Production Data
 
 Always use `db_pull` and test locally before deploying:
 
@@ -415,7 +463,7 @@ db_pull && db_migrate_test && db_validate_test
 
 ### 3. Keep Validation Comprehensive
 
-Don't just check that migration didn't crash - verify the schema is correct:
+Don't just check that migration didn't crash — verify the schema is correct. On the server, validation is the last gate before the snapshot replaces the live database:
 
 ```typescript
 // Not enough
@@ -427,7 +475,11 @@ const hasNewTable = tables.some(t => t.name === "sessions");
 if (!hasNewTable) throw new Error("sessions table missing");
 ```
 
-### 4. Deployment Strategy for Schema Changes
+### 4. Set `migrationsDir` and Use `deploy --auto`
+
+With `"migrationsDir"` in your database block, `deploy_check` and `deploy --auto` can tell whether the next deploy actually needs the database workflow — avoiding both unnecessary DB windows and forgotten migrations.
+
+### 5. Deployment Strategy for Schema Changes
 
 For complex migrations:
 1. Deploy backward-compatible code first (works with old schema)
@@ -436,7 +488,7 @@ For complex migrations:
 
 For simple additions (new columns, tables), you can deploy together.
 
-### 5. Monitor Deployments
+### 6. Monitor Deployments
 
 After deploying, watch the logs:
 - Service starts correctly
@@ -531,17 +583,18 @@ Before deploying a service with database changes:
 - [ ] Migration script reads `DB_PATH` environment variable
 - [ ] Validation script verifies schema changes
 - [ ] `deploy_preflight` passes all checks
-- [ ] Tested locally: `db_pull && db_migrate_test && db_validate_test`
+- [ ] Rehearsed locally: `db_pull && db_migrate_test && db_validate_test`
 - [ ] Migration output shows `deploy-tmp/db.sqlite` path (not the fallback)
 - [ ] Migration is idempotent (safe to run multiple times)
 - [ ] Validation is comprehensive (checks actual schema, not just "doesn't crash")
 - [ ] Added `deploy-tmp/` to `.gitignore`
 - [ ] Documented migration in commit message
+- [ ] Deploy with `deploy --db` (or `deploy --auto` with `migrationsDir` set)
 - [ ] Optional: Added custom health check endpoint
 
 ## Need Help?
 
-- Check deployment logs: `deploy_status your-service`
+- Check deployment status: `deploy_status your-service`
 - View service logs: `ssh server 'sudo journalctl -u your-service -n 100'`
-- Test locally first: `db_pull && db_migrate_test`
-- Rollback if needed: `deploy_rollback your-service`
+- Rehearse locally first: `db_pull && db_migrate_test`
+- Rollback if needed: `deploy_rollback your-service [--db]`
