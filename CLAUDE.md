@@ -252,7 +252,9 @@ Rotation happens automatically (with the service stopped):
 2. `VACUUM INTO` current → `backup.1` (consistent single-file snapshot, WAL folded in)
 3. migrated snapshot → `current` (sidecars removed in the same step)
 
-Restoring a backup always clears `-wal`/`-shm` sidecars — restoring the main file next to stale sidecars reproduces the corruption the workflow exists to prevent.
+Restoring a backup always clears `-wal`/`-shm` sidecars — restoring the main file next to stale sidecars reproduces the corruption the workflow exists to prevent. Restored files are integrity-checked before the service starts.
+
+**Note:** `deploy_rollback --db` and auto-recovery only ever restore `backup.1` — it does not rotate, so running rollback twice does NOT walk back to `backup.2`. Reaching `backup.2` is a manual server operation (deliberate: an automated two-step-back is more likely to be a mistake than an intent).
 
 ### Local Development Workflow
 
@@ -542,7 +544,7 @@ const merged = { ...structure[name], live: state[name]?.live ?? true };
 ### Health Checks
 
 - Uses `nc -z localhost {port}` for TCP check (or custom `--health-check` command)
-- Retries 10 times with 1s delay
+- Retries 60 times with 1s delay — generous on purpose: services that run their own migrations at boot start slowest right after a big migration set, and a false timeout triggers recovery over a healthy deploy
 - If unhealthy, deploy.ts auto-recovers to the previous commit (and previous DB if swapped); only if recovery also fails does the service stay in maintenance
 
 ## Adding a New Service

@@ -128,11 +128,14 @@ async function checkSystemdService(serviceName: string): Promise<boolean> {
   }
 }
 
+// Default 60 attempts (1s apart): services that run their own migrations at
+// boot start slowest right after a big migration set — a false timeout here
+// doesn't just report failure, it triggers recovery over a healthy deploy.
 async function waitForHealthy(
   serviceName: string,
   port: number,
   customHealthCheck?: string,
-  maxAttempts = 10
+  maxAttempts = 60
 ): Promise<boolean> {
   console.log(`⏳ Waiting for service to be healthy...`);
 
@@ -254,6 +257,8 @@ async function recover(
         folder,
         `cp '${dbFile}.backup.1' '${dbFile}' && rm -f '${dbFile}-wal' '${dbFile}-shm'`
       );
+      // Don't silently put back something broken
+      await $`sudo -u ${folder} bun ${DB_TOOL} integrity ${dbFile}`;
     }
 
     console.log(`🔄 Restarting service on previous version...`);
@@ -365,6 +370,10 @@ async function deploy(
       // WAL-mode database by copying app.sqlite alone.
       console.log(`📸 Snapshotting database...`);
       await $`sudo -u ${folder} bun ${DB_TOOL} snapshot ${file} ${migrating}`;
+
+      // Fail fast if the LIVE database is already damaged — before migrating,
+      // and critically before backup rotation snapshots the damage into backup.1.
+      await $`sudo -u ${folder} bun ${DB_TOOL} integrity ${migrating}`;
 
       console.log(`🔄 Running migration on snapshot...`);
       console.log(`   DB_PATH=${migrating} ${cfg.database.migrate}`);
@@ -505,6 +514,8 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
         folder,
         `test -f '${file}.backup.1' && cp '${file}.backup.1' '${file}' && rm -f '${file}-wal' '${file}-shm'`
       );
+      // Don't silently put back something broken
+      await $`sudo -u ${folder} bun ${DB_TOOL} integrity ${file}`;
     }
 
     // Restart
