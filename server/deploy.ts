@@ -131,13 +131,15 @@ async function checkSystemdService(serviceName: string): Promise<boolean> {
 // Default 60 attempts (1s apart): services that run their own migrations at
 // boot start slowest right after a big migration set — a false timeout here
 // doesn't just report failure, it triggers recovery over a healthy deploy.
+// Bails immediately if the systemd unit enters "failed" state — no point
+// polling the port for a process systemd already knows is dead.
 async function waitForHealthy(
   serviceName: string,
   port: number,
   customHealthCheck?: string,
   maxAttempts = 60
 ): Promise<boolean> {
-  console.log(`⏳ Waiting for service to be healthy...`);
+  console.log(`⏳ Waiting for service to be healthy (up to ${maxAttempts}s)...`);
 
   for (let i = 0; i < maxAttempts; i++) {
     try {
@@ -151,10 +153,37 @@ async function waitForHealthy(
         return true;
       }
     } catch {
+      // Fail fast: unit crashed and is not auto-restarting
+      try {
+        await $`systemctl is-failed --quiet ${serviceName}`.quiet();
+        console.error(`❌ Unit '${serviceName}' entered failed state — giving up early`);
+        console.error(`   sudo journalctl -u ${serviceName} -n 50`);
+        return false;
+      } catch {
+        // Not in failed state — still starting (or auto-restarting), keep waiting
+      }
+      if (i > 0 && i % 10 === 0) {
+        console.log(`   ...still waiting (${i}/${maxAttempts}s)`);
+      }
       await Bun.sleep(1000);
     }
   }
   return false;
+}
+
+// Guard against Ctrl+C / hangup during the DB swap and recovery — aborting
+// mid-way leaves the service stopped and in maintenance with no recovery run.
+let criticalSection = "";
+function installSignalGuard(): void {
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => {
+      if (criticalSection) {
+        console.error(`\n⚠️  ${sig} ignored — ${criticalSection} in progress, aborting now would strand the service`);
+      } else {
+        process.exit(130);
+      }
+    });
+  }
 }
 
 // Run a shell command as the service user
@@ -236,6 +265,7 @@ async function recover(
   dbFile?: string
 ): Promise<void> {
   console.log(`\n⏪ Auto-recovering to ${prevCommit.slice(0, 7)}...`);
+  criticalSection = "auto-recovery";
   try {
     await $`cd ${servicePath} && sudo -u ${folder} git reset --hard ${prevCommit}`;
 
@@ -271,10 +301,12 @@ async function recover(
     }
 
     await setMaintenance(serviceName, false);
+    criticalSection = "";
     console.log(
       `✅ Recovered on ${prevCommit.slice(0, 7)} — maintenance lifted. The deploy itself FAILED.`
     );
   } catch (error) {
+    criticalSection = "";
     console.error(`\n❌ Recovery failed: ${error}`);
     console.error(`⚠️  Service left in MAINTENANCE mode. Manual intervention required:`);
     console.error(`   sudo systemctl status ${folder}`);
@@ -364,6 +396,7 @@ async function deploy(
       db = { file, migrating };
 
       console.log(`⏸  Stopping service for database window...`);
+      criticalSection = "database window";
       await $`sudo systemctl stop ${folder}`;
 
       // VACUUM INTO folds the WAL into one consistent file — never copy a
@@ -421,6 +454,7 @@ async function deploy(
     // Step 8: Maintenance mode OFF
     console.log(`🟢 Disabling maintenance mode...`);
     await setMaintenance(serviceName, false);
+    criticalSection = "";
 
     console.log(`\n✅ Deployment successful!\n`);
   } catch (error) {
@@ -486,6 +520,7 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
   try {
     // Stop before touching code or database
     console.log(`⏸  Stopping service...`);
+    criticalSection = "rollback";
     await $`sudo systemctl stop ${folder}`;
 
     // Reset to previous commit
@@ -534,6 +569,7 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
     // Maintenance mode OFF
     console.log(`🟢 Disabling maintenance mode...`);
     await setMaintenance(serviceName, false);
+    criticalSection = "";
 
     console.log(`\n✅ Rollback successful!\n`);
   } catch (error) {
@@ -548,6 +584,7 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  installSignalGuard();
   const args = process.argv.slice(2);
   const serviceName = args.find(a => !a.startsWith("--"));
   const command = args.find(a => a === "--status" || a === "--rollback");
