@@ -98,50 +98,51 @@ async function loadServices(): Promise<Services> {
 async function checkSystemdStatus(
   serviceName: string
 ): Promise<{ status: string; unit?: string }> {
-  // Try multiple naming patterns to find the actual systemd unit
+  // Try multiple naming patterns to find the actual systemd unit.
+  // The first pattern whose unit FILE exists wins, regardless of its active
+  // state — a failed/inactive exact-match unit must not fall through to an
+  // unrelated pattern.
   const patterns = [
     serviceName, // exact match (e.g., "golf-serie")
     `sig-${serviceName}`, // sig- prefix (e.g., "sig-gsp")
     `${serviceName}-server`, // -server suffix (e.g., "golf-improver-server")
     `${serviceName.replace(/s$/, "")}-calculator`, // singular + calculator (e.g., "booking-calculator" from "bookings")
     `sig-${serviceName.replace(/s$/, "")}`, // sig- prefix with singular (e.g., "sig-booking" from "bookings")
-    `gsp-calculator`, // specific for mycal → gsp-calculator mapping
+    ...(serviceName === "mycal" ? ["gsp-calculator"] : []), // mycal → gsp-calculator mapping
   ];
 
   for (const pattern of patterns) {
+    // Does the unit file exist? (LoadState is "loaded" for real units,
+    // "not-found" otherwise; systemctl show exits 0 either way on most
+    // systemd versions, so also treat a thrown error as not-found.)
+    let loadState: string;
     try {
-      const result = await $`systemctl is-active ${pattern}`.text();
-      const status = result.trim();
-      // If we get a definitive answer (not "inactive"), use it
-      if (status !== "inactive") {
-        return { status, unit: pattern };
-      }
-      // If it's inactive, verify it actually exists as a unit
-      try {
-        await $`systemctl status ${pattern}`.quiet();
-        // Unit exists, it's really inactive
-        return { status: "inactive", unit: pattern };
-      } catch {
-        // Unit doesn't exist, try next pattern
-        continue;
-      }
+      loadState = (
+        await $`systemctl show -p LoadState --value ${pattern}`.quiet()
+      )
+        .text()
+        .trim();
     } catch {
-      // Try next pattern
-      continue;
+      loadState = "not-found";
     }
+    if (loadState !== "loaded") continue;
+
+    // Unit exists — report its actual state. is-active exits non-zero for
+    // anything but "active", so never let that throw skip the unit.
+    let state: string;
+    try {
+      state = (await $`systemctl is-active ${pattern}`.quiet()).text().trim();
+    } catch (err: any) {
+      state = (err?.stdout?.toString?.() ?? "").trim() || "unknown";
+    }
+    if (state === "active" || state === "inactive" || state === "failed") {
+      return { status: state, unit: pattern };
+    }
+    // activating/deactivating/etc.
+    return { status: "unknown", unit: pattern };
   }
 
-  // None of the patterns worked, check if it's failed
-  for (const pattern of patterns) {
-    try {
-      const status = await $`systemctl status ${pattern}`.text();
-      if (status.includes("failed")) return { status: "failed", unit: pattern };
-    } catch {
-      // ignore
-    }
-  }
-
-  return { status: "inactive" };
+  return { status: "unknown" };
 }
 
 async function checkPortOpen(port: number): Promise<boolean> {
