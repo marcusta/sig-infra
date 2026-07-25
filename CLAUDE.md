@@ -42,6 +42,8 @@ Infrastructure scripts for Sweden Indoor Golf services running on `app.swedenind
 - All changes go through services files → `generate.ts` → Caddyfile
 - Uses `cat | sudo tee` to preserve Docker bind mount inodes
 - Automatically formats and reloads Caddy after generation
+- **Validated before it is written**: the candidate config is `docker cp`'d into the Caddy container and checked with `caddy validate` first. An invalid config aborts with nothing written. (Without this, a bad generate is silent — `caddy reload` fails so the running server keeps serving, but the file on disk is broken and the next container restart takes every service down.)
+- The previous file is kept at `Caddyfile.bak` and restored automatically if the reload fails, so disk always matches the config Caddy is actually running
 
 **Maintenance Mode:**
 - Swaps Caddy block from `reverse_proxy` to static file server

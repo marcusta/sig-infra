@@ -21,7 +21,10 @@ const SCRIPT_DIR = import.meta.dir;
 const SERVICES_STRUCTURE_FILE = `${SCRIPT_DIR}/services.json`;
 const SERVICES_STATE_FILE = `${SCRIPT_DIR}/services-state.json`;
 const CADDYFILE_PATH = "/srv/caddy/config/Caddyfile";
+const CADDYFILE_BACKUP = `${CADDYFILE_PATH}.bak`;
 const TEMP_FILE = "/tmp/Caddyfile.new";
+const CADDY_CONTAINER = "caddy";
+const CONTAINER_STAGING = "/tmp/Caddyfile.candidate";
 const DOMAIN = "app.swedenindoorgolf.se";
 const MAINTENANCE_ROOT = "/maintenance";
 
@@ -164,6 +167,39 @@ ${serviceBlocks}
 `;
 }
 
+// Check the candidate config INSIDE the Caddy container before it replaces the
+// live file. Without this a bad generate silently destroys a good Caddyfile:
+// `caddy reload` fails so the running process keeps serving the old config and
+// nothing looks broken — but the file on disk is now invalid, and the next
+// container restart takes every service down at once.
+//
+// Distinguishes "config is invalid" (abort) from "couldn't run the check"
+// (warn and continue — the container being down is not a reason to block a
+// regeneration, and the backup/restore below still covers us).
+async function validateCaddyfile(content: string): Promise<"valid" | "invalid" | "skipped"> {
+  await Bun.write(TEMP_FILE, content);
+
+  try {
+    await $`sudo docker cp ${TEMP_FILE} ${CADDY_CONTAINER}:${CONTAINER_STAGING}`.quiet();
+  } catch {
+    console.warn("⚠️  Could not stage config in the caddy container — skipping validation");
+    return "skipped";
+  }
+
+  try {
+    await $`sudo docker exec ${CADDY_CONTAINER} caddy validate --config ${CONTAINER_STAGING} --adapter caddyfile`.quiet();
+    console.log("✅ Caddyfile validated");
+    return "valid";
+  } catch (error: any) {
+    console.error("❌ Generated Caddyfile is INVALID — live config left untouched:\n");
+    const detail = (error?.stderr?.toString?.() || error?.stdout?.toString?.() || String(error)).trim();
+    console.error(detail);
+    return "invalid";
+  } finally {
+    await $`sudo docker exec ${CADDY_CONTAINER} rm -f ${CONTAINER_STAGING}`.quiet().nothrow();
+  }
+}
+
 async function writeCaddyfile(content: string, dryRun: boolean): Promise<void> {
   if (dryRun) {
     console.log("📋 [DRY-RUN] Would generate:\n");
@@ -172,6 +208,10 @@ async function writeCaddyfile(content: string, dryRun: boolean): Promise<void> {
     console.log("─".repeat(60));
     return;
   }
+
+  // Keep the last known-good file so a failed reload can put disk back in sync
+  // with what Caddy is actually running. nothrow: absent on the very first run.
+  await $`sudo cp -f ${CADDYFILE_PATH} ${CADDYFILE_BACKUP}`.quiet().nothrow();
 
   // Write to temp file first
   await Bun.write(TEMP_FILE, content);
@@ -183,6 +223,25 @@ async function writeCaddyfile(content: string, dryRun: boolean): Promise<void> {
   console.log("✅ Caddyfile written");
 }
 
+// Reload failed → Caddy is still serving the OLD config, but the file on disk is
+// the new one. Put the file back so disk matches the running process; otherwise
+// the next restart silently boots a config nobody chose.
+async function restoreCaddyfile(): Promise<void> {
+  try {
+    await $`sudo test -f ${CADDYFILE_BACKUP}`.quiet();
+  } catch {
+    console.error("⚠️  No backup to restore — Caddyfile on disk is the failed config");
+    return;
+  }
+  try {
+    // cat | tee, not mv: the Docker bind mount requires the inode to survive
+    await $`sudo cat ${CADDYFILE_BACKUP} | sudo tee ${CADDYFILE_PATH} > /dev/null`;
+    console.error("↩️  Restored previous Caddyfile from .bak");
+  } catch (error) {
+    console.error(`⚠️  Could not restore backup: ${error}`);
+  }
+}
+
 async function reloadCaddy(dryRun: boolean): Promise<void> {
   if (dryRun) {
     console.log("📋 [DRY-RUN] Would reload Caddy");
@@ -192,11 +251,12 @@ async function reloadCaddy(dryRun: boolean): Promise<void> {
   console.log("🔄 Formatting and reloading Caddy...");
 
   try {
-    await $`sudo docker exec -w /etc/caddy caddy caddy fmt --overwrite Caddyfile`.quiet();
-    await $`sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force`;
+    await $`sudo docker exec -w /etc/caddy ${CADDY_CONTAINER} caddy fmt --overwrite Caddyfile`.quiet();
+    await $`sudo docker exec ${CADDY_CONTAINER} caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force`;
     console.log("✅ Caddy reloaded");
   } catch (error) {
     console.error("❌ Caddy reload failed. Check logs with: sudo docker logs caddy --tail 20");
+    await restoreCaddyfile();
     throw error;
   }
 }
@@ -326,6 +386,16 @@ async function main(): Promise<void> {
   }
 
   const caddyfile = generateCaddyfile(services);
+
+  // Validate BEFORE the live file is touched — an invalid config must never
+  // reach disk, even though a failed reload would leave Caddy itself running.
+  if (!dryRun) {
+    if ((await validateCaddyfile(caddyfile)) === "invalid") {
+      console.error("\n❌ Aborting — no changes written. Fix services.json and retry.");
+      process.exit(1);
+    }
+  }
+
   await writeCaddyfile(caddyfile, dryRun);
 
   if (!dryRun) {
