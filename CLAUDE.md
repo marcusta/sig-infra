@@ -228,14 +228,16 @@ Local                           Server (deploy.ts <service> --db)
                                 13. Integrity check in final location
                                 14. Start service
                                 15. Health check (TCP or custom)
-                                16. Maintenance mode OFF
+                                16. Record rollback target
+                                    (refs/sig-deploy/rollback)
+                                17. Maintenance mode OFF
                                 ←────────────────── Success/Fail
                                 On fail: auto-recover — git reset to
                                 recorded commit, reinstall, restore
                                 backup.1 (only if DB was swapped),
                                 restart. If recovery fails: stays in
                                 maintenance.
-17. Tail logs via journalctl
+18. Tail logs via journalctl
 ```
 
 **Failure semantics:**
@@ -390,7 +392,7 @@ Then commit and push changes (GitOps workflow).
 deploy_preflight            # Validate deployment setup (deploy.json, scripts, remote state)
 deploy                      # Full deploy from current directory
 deploy_status [service]     # Check service status
-deploy_rollback [service]   # Revert to previous commit
+deploy_rollback [service]   # Revert to last recorded good commit
 ```
 
 **Database Development (requires deploy.json):**
@@ -541,7 +543,23 @@ const merged = { ...structure[name], live: state[name]?.live ?? true };
 1. **deploy** (default) — Full deployment with health checks, toggles state file, auto-recovers to the pre-deploy commit on failure
 2. **--db** — Include the server-side database workflow (stop → snapshot → migrate → validate → backup → swap → integrity check → start)
 3. **--status** — Check service status (systemd + Caddy)
-4. **--rollback [--db]** — Git reset to HEAD~1 and redeploy; `--db` also restores database backup.1
+4. **--rollback [--db]** — Git reset to the last recorded good commit and redeploy; `--db` also restores database backup.1
+
+### Rollback Target Tracking
+
+A deploy can pull several commits at once, so `HEAD~1` afterwards is *not* the version that was previously serving traffic. Every successful deploy therefore records the commit it replaced as a git ref inside the service repo:
+
+```
+refs/sig-deploy/rollback
+```
+
+`--rollback` resets to that ref. It lives outside `refs/heads` and `refs/tags`, so it is never pushed and never shows up in `git tag`/`git branch`.
+
+- **No ref recorded** (first deploy since this was added, or already rolled back) → falls back to `HEAD~1` with a printed warning.
+- **Ref equals HEAD** → rollback refuses; the service was already rolled back or auto-recovered.
+- The ref is cleared after a successful rollback or auto-recovery, since the commit behind it is no longer known-good.
+
+`bun deploy.ts <service> --status` prints the current rollback target.
 
 ### Health Checks
 
@@ -595,7 +613,9 @@ deploy_rollback my-service --db     # code + restore DB backup.1 (clears WAL/SHM
 ssh marcus@app.swedenindoorgolf.se
 sudo systemctl stop my-service                      # stop BEFORE touching code or DB
 cd /srv/my-service
-sudo -u my-service git reset --hard HEAD~1
+# Prefer the recorded target over HEAD~1 — a deploy may have pulled many commits:
+sudo -u my-service git rev-parse refs/sig-deploy/rollback   # empty = none recorded
+sudo -u my-service git reset --hard <that-sha>              # else: HEAD~1
 # If the DB needs restoring (never restore next to stale sidecars):
 sudo -u my-service cp data/db.sqlite.backup.1 data/db.sqlite
 sudo -u my-service rm -f data/db.sqlite-wal data/db.sqlite-shm

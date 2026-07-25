@@ -257,6 +257,57 @@ async function readDeployConfig(servicePath: string): Promise<{
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Rollback target
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A single deploy can pull many commits, so HEAD~1 afterwards is NOT the version
+// that was previously running. On every successful deploy we record the commit
+// that WAS running, as a git ref inside the service repo — no extra state file,
+// and it travels with the checkout. `--rollback` returns to exactly that commit.
+// The ref lives outside refs/heads and refs/tags, so it never pushes or clutters.
+const ROLLBACK_REF = "refs/sig-deploy/rollback";
+
+async function setRollbackTarget(
+  folder: string,
+  servicePath: string,
+  commit: string
+): Promise<void> {
+  try {
+    await $`sudo -u ${folder} git -C ${servicePath} update-ref ${ROLLBACK_REF} ${commit}`.quiet();
+  } catch (error) {
+    // Non-fatal: the deploy itself succeeded, only rollback precision is lost
+    console.error(`⚠️  Could not record rollback target: ${error}`);
+    console.error(`   --rollback will fall back to HEAD~1`);
+  }
+}
+
+async function getRollbackTarget(
+  folder: string,
+  servicePath: string
+): Promise<string | undefined> {
+  try {
+    const sha = (
+      await $`sudo -u ${folder} git -C ${servicePath} rev-parse --verify ${ROLLBACK_REF}`.quiet()
+    )
+      .text()
+      .trim();
+    return sha || undefined;
+  } catch {
+    return undefined; // Never deployed since this was added, or ref cleared
+  }
+}
+
+// Called once the service is running the recorded target: there is no known-good
+// commit behind it any more, so a further rollback must not reuse a stale ref.
+async function clearRollbackTarget(folder: string, servicePath: string): Promise<void> {
+  try {
+    await $`sudo -u ${folder} git -C ${servicePath} update-ref -d ${ROLLBACK_REF}`.quiet();
+  } catch {
+    // No ref to delete — fine
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Recovery
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -304,6 +355,9 @@ async function recover(
     if (!healthy) {
       throw new Error(`Service not healthy after recovery`);
     }
+
+    // Now running prevCommit — the previously recorded target is behind us
+    await clearRollbackTarget(folder, servicePath);
 
     await setMaintenance(serviceName, false);
     criticalSection = "";
@@ -456,7 +510,11 @@ async function deploy(
     }
     console.log(`✅ Service is healthy`);
 
-    // Step 8: Maintenance mode OFF
+    // Step 8: Record the rollback target BEFORE lifting maintenance — the
+    // commit we just replaced is the last version known to have served traffic.
+    await setRollbackTarget(folder, servicePath, prevCommit);
+
+    // Step 9: Maintenance mode OFF
     console.log(`🟢 Disabling maintenance mode...`);
     await setMaintenance(serviceName, false);
     criticalSection = "";
@@ -474,6 +532,12 @@ async function deploy(
 }
 
 async function status(serviceName: string, serverFolder?: string): Promise<void> {
+  // The systemd unit and /srv directory follow the FOLDER, not the services.json
+  // key — they differ whenever deploy.json sets serviceName (e.g. key "bookings",
+  // folder "sig-booking"). Deploy has always used the folder; status must too.
+  const folder = serverFolder || serviceName;
+  const servicePath = `/srv/${folder}`;
+
   const services = await loadServices();
 
   if (!services[serviceName]) {
@@ -482,20 +546,35 @@ async function status(serviceName: string, serverFolder?: string): Promise<void>
   }
 
   const config = services[serviceName];
-  const systemdActive = await checkSystemdService(serviceName);
+  const systemdActive = await checkSystemdService(folder);
 
   console.log(`\nService: ${serviceName}`);
   console.log(`─`.repeat(40));
+  console.log(`Folder:      ${servicePath}`);
   console.log(`Port:        ${config.port}`);
   console.log(`Caddy:       ${config.live ? "🟢 live" : "🚧 maintenance"}`);
-  console.log(`Systemd:     ${systemdActive ? "🟢 active" : "🔴 inactive"}`);
+  console.log(`Systemd:     ${systemdActive ? "🟢 active" : "🔴 inactive"} (${folder})`);
 
   // Get current commit
   try {
-    const result = await $`cd /srv/${serviceName} && git log -1 --format="%h %s" 2>/dev/null`.text();
+    const result = await $`sudo -u ${folder} git -C ${servicePath} log -1 --format="%h %s"`.text();
     console.log(`Last commit: ${result.trim()}`);
   } catch {
     console.log(`Last commit: unknown`);
+  }
+
+  const rollbackTo = await getRollbackTarget(folder, servicePath);
+  if (rollbackTo) {
+    try {
+      const desc = (
+        await $`sudo -u ${folder} git -C ${servicePath} log -1 --format="%h %s" ${rollbackTo}`.text()
+      ).trim();
+      console.log(`Rollback to: ${desc}`);
+    } catch {
+      console.log(`Rollback to: ${rollbackTo.slice(0, 7)}`);
+    }
+  } else {
+    console.log(`Rollback to: (not recorded — would use HEAD~1)`);
   }
 
   console.log(``);
@@ -507,16 +586,35 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
 
   console.log(`\n⏪ Rolling back ${serviceName}${withDb ? " (code + database)" : ""}...\n`);
 
-  // Get current and previous commit for display
-  const currentCommit = await $`cd ${servicePath} && git log -1 --format="%h %s"`.text();
+  const currentSha = (await $`sudo -u ${folder} git -C ${servicePath} rev-parse HEAD`.text()).trim();
+  const currentCommit = await $`sudo -u ${folder} git -C ${servicePath} log -1 --format="%h %s"`.text();
   console.log(`Current: ${currentCommit.trim()}`);
 
-  try {
-    const prevCommit = await $`cd ${servicePath} && git log -2 --format="%h %s" | tail -1`.text();
-    console.log(`Rolling back to: ${prevCommit.trim()}`);
-  } catch {
-    // ignore
+  // Prefer the commit the last successful deploy recorded. HEAD~1 is only
+  // correct when the deploy pulled exactly one commit — it usually pulls several,
+  // and then HEAD~1 lands in the middle of the batch that was never deployed.
+  let target = await getRollbackTarget(folder, servicePath);
+  if (target) {
+    if (target === currentSha) {
+      console.error(`❌ Recorded rollback target is the running commit — nothing to roll back to.`);
+      console.error(`   The service was likely already rolled back or auto-recovered.`);
+      process.exit(1);
+    }
+  } else {
+    console.log(`⚠️  No recorded rollback target — falling back to HEAD~1.`);
+    console.log(`   If the last deploy pulled several commits, this lands mid-batch.`);
+    try {
+      target = (await $`sudo -u ${folder} git -C ${servicePath} rev-parse --verify HEAD~1`.text()).trim();
+    } catch {
+      console.error(`❌ No previous commit to roll back to`);
+      process.exit(1);
+    }
   }
+
+  const targetDesc = (
+    await $`sudo -u ${folder} git -C ${servicePath} log -1 --format="%h %s" ${target}`.text()
+  ).trim();
+  console.log(`Rolling back to: ${targetDesc}`);
 
   // Maintenance mode ON
   console.log(`\n🚧 Enabling maintenance mode...`);
@@ -528,9 +626,9 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
     criticalSection = "rollback";
     await $`sudo systemctl stop ${folder}`;
 
-    // Reset to previous commit
-    console.log(`📥 Reverting to previous commit...`);
-    await $`cd ${servicePath} && sudo -u ${folder} git reset --hard HEAD~1`;
+    // Reset to the resolved target (recorded last-good commit, or HEAD~1)
+    console.log(`📥 Reverting to ${target.slice(0, 7)}...`);
+    await $`sudo -u ${folder} git -C ${servicePath} reset --hard ${target}`;
 
     // Reinstall deps for the reverted code
     const installCmd = await detectInstallCmd(servicePath);
@@ -570,6 +668,9 @@ async function rollback(serviceName: string, serverFolder?: string, withDb = fal
     if (!healthy) {
       throw new Error(`Service failed to become healthy after rollback`);
     }
+
+    // Now running the recorded target — don't let a second rollback reuse it
+    await clearRollbackTarget(folder, servicePath);
 
     // Maintenance mode OFF
     console.log(`🟢 Disabling maintenance mode...`);
