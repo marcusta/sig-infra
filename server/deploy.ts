@@ -216,20 +216,25 @@ async function detectInstallCmd(servicePath: string): Promise<string | undefined
   return undefined; // No lockfile — no install step
 }
 
+// Generous timeout: a cold install on a new lockfile legitimately takes minutes.
+// A timeout at this length is a real failure, not the few-seconds "bun install
+// hangs after it already finished" quirk — so it must NOT be swallowed. This
+// step runs immediately before the database is stopped, migrated and swapped;
+// continuing on a half-installed node_modules migrates with the wrong code.
+const INSTALL_TIMEOUT_SECS = 300;
+
 async function runInstall(folder: string, servicePath: string, installCmd: string): Promise<void> {
   console.log(`📦 Installing dependencies: ${installCmd}`);
   // Use bash -c to ensure proper PATH and environment
-  // Timeout after 30 seconds - bun install sometimes hangs at the end even when done
   try {
-    await $`cd ${servicePath} && timeout 30 sudo -u ${folder} bash -c '${installCmd}'`;
+    await $`cd ${servicePath} && timeout ${INSTALL_TIMEOUT_SECS} sudo -u ${folder} bash -c '${installCmd}'`;
   } catch (error: any) {
-    // Exit code 124 means timeout - bun install likely finished but hung
     if (error.exitCode === 124) {
-      console.log(`⚠️  Install command timed out (likely finished but hung)`);
-    } else {
-      console.error(`❌ Install command failed: ${error}`);
-      throw new Error("Dependency installation failed");
+      console.error(`❌ Install command timed out after ${INSTALL_TIMEOUT_SECS}s: ${installCmd}`);
+      throw new Error("Dependency installation timed out");
     }
+    console.error(`❌ Install command failed: ${error}`);
+    throw new Error("Dependency installation failed");
   }
 }
 
