@@ -745,10 +745,41 @@ deploy() {
   # Step 2: Git commit & push
   echo "📦 Handling Git workflow..."
 
-  if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+  # `git commit -am` only picks up TRACKED modifications, but _deploy_migrations_changed
+  # counts untracked files too. A brand-new migration file therefore used to make --auto
+  # announce "deploying WITH migration", commit nothing, push nothing, and deploy a
+  # version that has no migration in it — a green deploy that did nothing.
+  # Untracked files must be surfaced here, never silently dropped.
+  local tracked_dirty="" untracked=""
+  git diff-index --quiet HEAD -- 2>/dev/null || tracked_dirty=1
+  untracked=$(git ls-files --others --exclude-standard)
+
+  local add_all=false
+  if [[ -n "$untracked" ]]; then
+    echo ""
+    echo "⚠️  Untracked files (a normal deploy commit does NOT include these):"
+    echo "$untracked" | sed 's/^/     /'
+    echo ""
+    read -r "include_untracked?Include them in the deploy commit? (y/n): "
+    if [[ "$include_untracked" == "y" ]]; then
+      add_all=true
+    elif [[ -n "$migrations_dir" ]] && echo "$untracked" | grep -qE "^${migrations_dir}(/|$)"; then
+      echo ""
+      echo "❌ Untracked files inside '$migrations_dir' were excluded."
+      echo "   The server would migrate without them. Aborting rather than deploying a no-op."
+      return 1
+    fi
+  fi
+
+  if [[ -n "$tracked_dirty" || "$add_all" == "true" ]]; then
     read -r "msg?Commit message (default: 'deploy'): "
     msg=${msg:-"deploy"}
-    git commit -am "$msg" || { echo "❌ Commit failed."; return 1; }
+    if [[ "$add_all" == "true" ]]; then
+      git add -A || { echo "❌ git add failed."; return 1; }
+      git commit -m "$msg" || { echo "❌ Commit failed."; return 1; }
+    else
+      git commit -am "$msg" || { echo "❌ Commit failed."; return 1; }
+    fi
   else
     echo "   No local changes to commit."
   fi
