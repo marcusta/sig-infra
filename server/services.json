@@ -40,5 +40,8 @@
   },
   "teacher-student": {
     "port": 4810
+  },
+  "golf-map": {
+    "port": 3801
   }
 }
