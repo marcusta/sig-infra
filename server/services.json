@@ -42,6 +42,7 @@
     "port": 4810
   },
   "golf-map": {
-    "port": 3801
+    "port": 3801,
+    "healthCheckPath": "/api/meta"
   }
 }
